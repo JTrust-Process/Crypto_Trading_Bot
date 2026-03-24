@@ -1,0 +1,15 @@
+# crypto_bot/config/settings.py
+
+SYMBOLS = ["BTC", "ETH"]
+
+TIMEFRAME = "5m"
+
+INITIAL_CAPITAL = 50.0
+
+RISK_PER_TRADE = 0.01
+MAX_EXPOSURE = 0.5
+
+STOP_LOSS_PCT = 0.03
+TAKE_PROFIT_PCT = 0.05
+
+POLL_INTERVAL = 5  # seconds

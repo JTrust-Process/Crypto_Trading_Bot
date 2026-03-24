@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.env/
+.venv/
+
+# Environment variables
+.env
+.env.local
+
+# IDEs
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Database / local data
+*.db
+*.sqlite3
+
+# Supabase / secrets
+config/secrets.py
+
+# Jupyter (if you ever use it)
+.ipynb_checkpoints/
+
+# Build files
+dist/
+build/
+*.egg-info/
+
+# Temporary files
+*.tmp
+*.swp
+
+# Testing / coverage
+.coverage
+htmlcov/
+
+# Node (if you later add dashboard frontend)
+node_modules/
