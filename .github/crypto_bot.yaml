@@ -1,0 +1,74 @@
+# .github/workflows/crypto_bot.yml
+#
+# Runs the crypto bot every 15 minutes, 24/7.
+# Each trigger is one cycle — main.py exits after processing all symbols.
+#
+# Secrets (set in GitHub → Settings → Secrets → Actions):
+#   PUBLIC_API_KEY   — Public brokerage API key
+#   PUBLIC_BASE_URL  — Public API base URL (e.g. https://api.public.com)
+#   SUPABASE_URL     — Supabase project URL
+#   SUPABASE_KEY     — Supabase service role key
+#
+# Non-secrets are hardcoded here so they're visible in version control.
+
+name: Crypto Bot
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 minutes, 24/7 (no market hours gate)
+  workflow_dispatch:          # manual trigger from GitHub UI for testing
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10       # kill the job if it hangs
+
+    env:
+      # ── Non-secrets: visible in repo, safe to hardcode ───────────────────
+      SYMBOLS: "BTC,ETH"
+      INITIAL_CAPITAL: "50"
+      RISK_PER_TRADE: "0.02"
+      STOP_LOSS_PCT: "0.03"
+      TAKE_PROFIT_PCT: "0.05"
+      RUN_ONCE: "1"           # signals main.py to run one cycle then exit
+
+      # ── Secrets: injected from GitHub Secrets ────────────────────────────
+      PUBLIC_API_KEY: ${{ secrets.PUBLIC_API_KEY }}
+      PUBLIC_BASE_URL: ${{ secrets.PUBLIC_BASE_URL }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      # Restore state.json from the previous run so positions survive
+      # between GitHub Actions runs (each run is a fresh VM).
+      - name: Restore bot state
+        uses: actions/cache@v4
+        with:
+          path: state.json
+          key: crypto-bot-state-${{ github.ref_name }}
+          restore-keys: |
+            crypto-bot-state-
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run bot
+        run: python main.py
+
+      # Save state.json after the run so the next run picks it up.
+      # This step runs even if the bot crashes so positions aren't lost.
+      - name: Save bot state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: crypto-bot-state-${{ github.ref_name }}
