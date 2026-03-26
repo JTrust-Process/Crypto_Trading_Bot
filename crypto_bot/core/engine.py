@@ -56,8 +56,9 @@ def run(monitor: Monitor, run_id: str | None) -> None:
             # 2. Strategy BUY
             if signal == "BUY" and not in_position:
                 usd_amount = risk.position_size_usd(price)
-                monitor.log_event(run_id, "buy", f"{symbol} size={size:.6f} at {price:.2f}")
+                monitor.log_event(run_id, "buy", f"{symbol} usd_amount={usd_amount:.2f} at {price:.2f}")
                 trader.buy(symbol, price, usd_amount)
+
 
             # 3. Strategy SELL
             elif signal == "SELL" and in_position:

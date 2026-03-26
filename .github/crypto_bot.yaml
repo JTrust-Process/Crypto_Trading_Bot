@@ -4,12 +4,12 @@
 # Each trigger is one cycle — main.py exits after processing all symbols.
 #
 # Secrets (set in GitHub → Settings → Secrets → Actions):
-#   PUBLIC_API_KEY   — Public brokerage API key
-#   PUBLIC_BASE_URL  — Public API base URL (e.g. https://api.public.com)
-#   SUPABASE_URL     — Supabase project URL
-#   SUPABASE_KEY     — Supabase service role key
+#   PUBLIC_SECRET  — Public brokerage secret key
+#   SUPABASE_URL   — Supabase project URL
+#   SUPABASE_KEY   — Supabase service role key
 #
 # Non-secrets are hardcoded here so they're visible in version control.
+# No PUBLIC_BASE_URL needed — API URLs are hardcoded constants in public_api.py.
 
 name: Crypto Bot
 
@@ -30,11 +30,10 @@ jobs:
       RISK_PER_TRADE: "0.02"
       STOP_LOSS_PCT: "0.03"
       TAKE_PROFIT_PCT: "0.05"
-      RUN_ONCE: "1"           # signals main.py to run one cycle then exit
+      RUN_ONCE: "1"           # main.py runs one cycle then exits
 
       # ── Secrets: injected from GitHub Secrets ────────────────────────────
-      PUBLIC_API_KEY: ${{ secrets.PUBLIC_API_KEY }}
-      PUBLIC_BASE_URL: ${{ secrets.PUBLIC_BASE_URL }}
+      PUBLIC_SECRET: ${{ secrets.PUBLIC_SECRET }}
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
 
@@ -44,13 +43,16 @@ jobs:
 
       # Restore state.json from the previous run so positions survive
       # between GitHub Actions runs (each run is a fresh VM).
+      # Cache key includes state.py hash — if the state schema changes,
+      # the old cache is ignored and a fresh default state is used instead
+      # of a stale file that would crash the bot.
       - name: Restore bot state
         uses: actions/cache@v4
         with:
           path: state.json
-          key: crypto-bot-state-${{ github.ref_name }}
+          key: crypto-bot-state-${{ github.ref_name }}-${{ hashFiles('crypto_bot/state/state.py') }}
           restore-keys: |
-            crypto-bot-state-
+            crypto-bot-state-${{ github.ref_name }}-
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -64,11 +66,11 @@ jobs:
       - name: Run bot
         run: python main.py
 
-      # Save state.json after the run so the next run picks it up.
-      # This step runs even if the bot crashes so positions aren't lost.
+      # Save state.json after every run — even if the bot crashed —
+      # so open positions are never lost due to a transient error.
       - name: Save bot state
         if: always()
         uses: actions/cache/save@v4
         with:
           path: state.json
-          key: crypto-bot-state-${{ github.ref_name }}
+          key: crypto-bot-state-${{ github.ref_name }}-${{ hashFiles('crypto_bot/state/state.py') }}

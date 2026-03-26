@@ -19,9 +19,9 @@ LOG_FILE = "bot_log.csv"           # CSV mirror of bot_logs
 # ── Lazy loaders — call these after load_dotenv() ─────────────────────────────
 
 def get_public_api_key() -> str:
-    val = os.getenv("PUBLIC_API_KEY")
+    val = os.getenv("PUBLIC_SECRET")
     if not val:
-        raise RuntimeError("PUBLIC_API_KEY env var not set")
+        raise RuntimeError("PUBLIC_SECRET env var not set")
     return val
 
 def get_public_base_url() -> str:
@@ -44,4 +44,4 @@ def get_supabase_key() -> str:
 
 def get_symbols() -> list[str]:
     raw = os.getenv("SYMBOLS")
-    return [s.strip() for s in raw.split(",")] if raw else SYMBOLS
+    return list(dict.fromkeys(s.strip() for s in raw.split(","))) if raw else SYMBOLS
