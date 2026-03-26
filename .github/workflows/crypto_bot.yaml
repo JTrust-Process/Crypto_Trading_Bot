@@ -1,30 +1,18 @@
 # .github/workflows/crypto_bot.yml
-#
-# Runs the crypto bot every 15 minutes, 24/7.
-# Each trigger is one cycle — main.py exits after processing all symbols.
-#
-# Secrets (set in GitHub → Settings → Secrets → Actions):
-#   PUBLIC_SECRET  — Public brokerage secret key
-#   SUPABASE_URL   — Supabase project URL
-#   SUPABASE_KEY   — Supabase service role key
-#
-# Non-secrets are hardcoded here so they're visible in version control.
-# No PUBLIC_BASE_URL needed — API URLs are hardcoded constants in public_api.py.
 
 name: Crypto Bot
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes, 24/7 (no market hours gate)
-  workflow_dispatch:          # manual trigger from GitHub UI for testing
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 10       # kill the job if it hangs
+    timeout-minutes: 10
 
     env:
-      # ── Non-secrets: visible in repo, safe to hardcode ───────────────────
       SYMBOLS: "BTC,ETH"
       INITIAL_CAPITAL: "50"
       RISK_PER_TRADE: "0.02"
@@ -32,8 +20,6 @@ jobs:
       TAKE_PROFIT_PCT: "0.05"
       RUN_ONCE: "1"
       DRY_RUN: "1"           # set to "0" when ready for live trading
-
-      # ── Secrets: injected from GitHub Secrets ────────────────────────────
       PUBLIC_SECRET: ${{ secrets.PUBLIC_SECRET }}
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
@@ -42,16 +28,12 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # Restore state.json from the previous run so positions survive
-      # between GitHub Actions runs (each run is a fresh VM).
-      # Cache key includes state.py hash — if the state schema changes,
-      # the old cache is ignored and a fresh default state is used instead
-      # of a stale file that would crash the bot.
+      # Restore: match any previously saved state for this branch
       - name: Restore bot state
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: state.json
-          key: crypto-bot-state-${{ github.ref_name }}-${{ hashFiles('crypto_bot/state/state.py') }}
+          key: crypto-bot-state-${{ github.ref_name }}-${{ github.run_id }}
           restore-keys: |
             crypto-bot-state-${{ github.ref_name }}-
 
@@ -67,11 +49,11 @@ jobs:
       - name: Run bot
         run: python main.py
 
-      # Save state.json after every run — even if the bot crashed —
-      # so open positions are never lost due to a transient error.
+      # Save: always use a unique key (run_id) so the save never collides
+      # with an existing immutable cache entry and silently fails.
       - name: Save bot state
         if: always()
         uses: actions/cache/save@v4
         with:
           path: state.json
-          key: crypto-bot-state-${{ github.ref_name }}-${{ hashFiles('crypto_bot/state/state.py') }}
+          key: crypto-bot-state-${{ github.ref_name }}-${{ github.run_id }}
