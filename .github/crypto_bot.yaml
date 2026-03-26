@@ -30,7 +30,8 @@ jobs:
       RISK_PER_TRADE: "0.02"
       STOP_LOSS_PCT: "0.03"
       TAKE_PROFIT_PCT: "0.05"
-      RUN_ONCE: "1"           # main.py runs one cycle then exits
+      RUN_ONCE: "1"
+      DRY_RUN: "1"           # set to "0" when ready for live trading
 
       # ── Secrets: injected from GitHub Secrets ────────────────────────────
       PUBLIC_SECRET: ${{ secrets.PUBLIC_SECRET }}

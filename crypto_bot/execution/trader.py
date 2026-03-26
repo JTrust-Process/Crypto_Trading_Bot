@@ -1,27 +1,23 @@
 # crypto_bot/execution/trader.py
 #
-# Trader reads/writes positions via the shared state dict (backed by state.json).
-# engine.py owns the state dict — Trader mutates it in place.
-#
-# Order amounts are in notional USD (e.g. $10.00 of BTC) because Public's
-# place_order API uses `amount` (notional) not `quantity` (base currency units).
+# DRY_RUN=1 → skips place_order(), logs trade to Supabase with reason
+# prefixed "DRY_RUN/" so paper trades are clearly distinguishable in the DB
+# but live in the same crypto_trades table.
 
 from crypto_bot.exchange.public_api import get_primary_account_id, place_order
 from crypto_bot.logging import supabase_logger
 from crypto_bot.logging.logger import log, log_error
-from crypto_bot.config.settings import STOP_LOSS_PCT, TAKE_PROFIT_PCT
+from crypto_bot.config.settings import STOP_LOSS_PCT, TAKE_PROFIT_PCT, is_dry_run
 
 
 class Trader:
     def __init__(self, state: dict, run_id: str | None = None):
-        """
-        Args:
-            state:  loaded state dict with keys "capital" and "positions"
-            run_id: current monitor run id, forwarded to trade logs
-        """
         self.state = state
         self.run_id = run_id
-        self._account_id = None  # lazy-fetched once per run
+        self._account_id = None
+        self._dry_run = is_dry_run()
+        if self._dry_run:
+            log("DRY RUN mode enabled — orders will be simulated, not placed", run_id)
 
     @property
     def positions(self) -> dict:
@@ -32,50 +28,46 @@ class Trader:
             self._account_id = get_primary_account_id()
         return self._account_id
 
-    # ── Orders ────────────────────────────────────────────────────────────────
+    def _place(self, symbol: str, side: str, amount: float) -> bool:
+        """
+        Execute or simulate an order.
+        Returns True on success, False on failure.
+        In DRY_RUN mode, always returns True without hitting the API.
+        """
+        if self._dry_run:
+            log(f"[DRY RUN] Would place {side} {symbol} ${amount:.2f}", self.run_id)
+            return True
+        try:
+            place_order(self._get_account_id(), symbol, side, amount)
+            return True
+        except Exception as e:
+            log_error(f"[trader] place_order {side} {symbol} failed: {e}", self.run_id)
+            return False
 
     def buy(self, symbol: str, price: float, usd_amount: float) -> None:
-        """
-        Place a BUY order for `usd_amount` dollars worth of `symbol`.
-
-        Args:
-            symbol:     e.g. "BTC"
-            price:      current price (for stop/TP calculation and logging)
-            usd_amount: notional USD to spend, e.g. 10.00
-        """
-        pair = symbol + "USD"
-        try:
-            order = place_order(self._get_account_id(), pair, "BUY", usd_amount)
-        except Exception as e:
-            log_error(f"[trader] place_order BUY {symbol} failed: {e}", self.run_id)
+        if not self._place(symbol, "BUY", usd_amount):
             return
 
-        size_estimate = usd_amount / price  # approximate — actual fill may differ
-
+        size_estimate = usd_amount / price
         self.positions[symbol] = {
             "entry": price,
             "usd_amount": usd_amount,
             "size_estimate": size_estimate,
-            "stop_loss": round(price * (1 - STOP_LOSS_PCT), 6),
-            "take_profit": round(price * (1 + TAKE_PROFIT_PCT), 6),
-            "order_id": order.get("orderId") or order.get("_clientOrderId"),
+            "stop_loss":    round(price * (1 - STOP_LOSS_PCT), 6),
+            "take_profit":  round(price * (1 + TAKE_PROFIT_PCT), 6),
         }
 
+        mode = "DRY RUN " if self._dry_run else ""
         log(
-            f"BUY  {symbol} | price={price:.2f} | amount=${usd_amount:.2f} | "
+            f"{mode}BUY  {symbol} | price={price:.2f} | amount=${usd_amount:.2f} | "
             f"SL={self.positions[symbol]['stop_loss']:.2f} "
             f"TP={self.positions[symbol]['take_profit']:.2f}",
             self.run_id,
         )
-        supabase_logger.log_trade(
-            symbol, "BUY", price, size_estimate, 0.0, "entry", self.run_id
-        )
+        reason = "DRY_RUN/entry" if self._dry_run else "entry"
+        supabase_logger.log_trade(symbol, "BUY", price, size_estimate, 0.0, reason, self.run_id)
 
     def sell(self, symbol: str, price: float, reason: str = "signal") -> None:
-        """
-        Sell the full open position in `symbol`.
-        Uses the same USD amount that was used to buy.
-        """
         if symbol not in self.positions:
             log_error(f"[trader] sell called for {symbol} but no open position", self.run_id)
             return
@@ -83,31 +75,24 @@ class Trader:
         pos = self.positions[symbol]
         usd_amount = pos["usd_amount"]
         size_estimate = pos.get("size_estimate", usd_amount / pos["entry"])
-
-        # Estimate PnL: (current price / entry price - 1) * USD invested
         pnl = (price / pos["entry"] - 1) * usd_amount
 
-        pair = symbol + "USD"
-        try:
-            place_order(self._get_account_id(), pair, "SELL", usd_amount)
-        except Exception as e:
-            log_error(f"[trader] place_order SELL {symbol} failed: {e}", self.run_id)
+        full_reason = f"DRY_RUN/{reason}" if self._dry_run else reason
+        if not self._place(symbol, "SELL", usd_amount):
             return
 
+        mode = "DRY RUN " if self._dry_run else ""
         log(
-            f"SELL {symbol} | price={price:.2f} | amount=${usd_amount:.2f} | "
+            f"{mode}SELL {symbol} | price={price:.2f} | amount=${usd_amount:.2f} | "
             f"pnl={pnl:+.4f} | reason={reason}",
             self.run_id,
         )
-        supabase_logger.log_trade(symbol, "SELL", price, size_estimate, pnl, reason, self.run_id)
+        supabase_logger.log_trade(symbol, "SELL", price, size_estimate, pnl, full_reason, self.run_id)
 
         self.state["capital"] += pnl
         del self.positions[symbol]
 
-    # ── Exit checks ───────────────────────────────────────────────────────────
-
     def check_exit(self, symbol: str, price: float) -> str | None:
-        """Returns 'STOP_LOSS', 'TAKE_PROFIT', or None."""
         pos = self.positions.get(symbol)
         if not pos:
             return None

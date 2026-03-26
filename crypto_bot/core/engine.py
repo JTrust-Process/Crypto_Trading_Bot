@@ -1,22 +1,20 @@
 # crypto_bot/core/engine.py
 #
-# One cycle = one GitHub Actions trigger.
-# No while True — RUN_ONCE=1 in the workflow.
+# One cycle per GitHub Actions trigger.
 #
-# Flow per run:
-#   1. Load state from state.json (positions + capital)
-#   2. For each symbol: fetch price → check exits → check entries
-#   3. Save state back to state.json
-#
-# monitor and run_id are passed in from main.py so engine stays testable
-# without needing a live Supabase connection.
+# Price history flow:
+#   1. Load state (includes price_history per symbol)
+#   2. Fetch current price, append to history
+#   3. Generate signal from real rolling EMA on that history
+#   4. Execute trades (or simulate if DRY_RUN=1)
+#   5. Save state (history persists for next run)
 
-from crypto_bot.config.settings import get_symbols, INITIAL_CAPITAL
+from crypto_bot.config.settings import get_symbols, INITIAL_CAPITAL, EMA_SLOW
 from crypto_bot.data.market_data import get_price
-from crypto_bot.strategy.signal import generate_signal, build_candles_from_price
+from crypto_bot.strategy.signal import generate_signal, warmup_progress
 from crypto_bot.execution.trader import Trader
 from crypto_bot.risk.manager import RiskManager
-from crypto_bot.state.state import load_state, save_state
+from crypto_bot.state.state import load_state, save_state, append_price, get_price_history
 from crypto_bot.logging.logger import log, log_warn, log_error
 from crypto_bot.logging.monitor import Monitor
 
@@ -27,8 +25,11 @@ def run(monitor: Monitor, run_id: str | None) -> None:
 
     # ── Load persistent state ─────────────────────────────────────────────────
     state = load_state()
-    log(f"State loaded — capital={state['capital']:.2f} "
-        f"open_positions={list(state['positions'].keys())}", run_id)
+    log(
+        f"State loaded — capital={state['capital']:.2f} "
+        f"open_positions={list(state['positions'].keys())}",
+        run_id,
+    )
 
     trader = Trader(state, run_id)
     risk = RiskManager(state["capital"])
@@ -37,15 +38,22 @@ def run(monitor: Monitor, run_id: str | None) -> None:
     for symbol in symbols:
         try:
             price = get_price(symbol)
-            log(f"{symbol} | price={price:.2f}", run_id)
 
+            # Append price to rolling history and generate signal
+            append_price(state, symbol, price)
+            prices = get_price_history(state, symbol)
             in_position = symbol in trader.positions
-            candles = build_candles_from_price(price)
-            signal = generate_signal(candles, in_position)
+            signal = generate_signal(prices, in_position)
+
+            # Show warmup progress until we have enough history for EMAs
+            if len(prices) <= EMA_SLOW + 1:
+                log(f"{symbol} | price={price:.2f} | signal={signal} | warmup {warmup_progress(prices)}", run_id)
+            else:
+                log(f"{symbol} | price={price:.2f} | signal={signal} | history={len(prices)} prices", run_id)
 
             monitor.log_event(run_id, "signal", f"{symbol} signal={signal} price={price:.2f}")
 
-            # 1. Check hard exits (stop-loss / take-profit) before strategy signals
+            # 1. Hard exits first (stop-loss / take-profit)
             exit_reason = trader.check_exit(symbol, price)
             if exit_reason:
                 log(f"{symbol} | exit triggered: {exit_reason}", run_id)
@@ -56,9 +64,8 @@ def run(monitor: Monitor, run_id: str | None) -> None:
             # 2. Strategy BUY
             if signal == "BUY" and not in_position:
                 usd_amount = risk.position_size_usd(price)
-                monitor.log_event(run_id, "buy", f"{symbol} usd_amount={usd_amount:.2f} at {price:.2f}")
+                monitor.log_event(run_id, "buy", f"{symbol} ${usd_amount:.2f} at {price:.2f}")
                 trader.buy(symbol, price, usd_amount)
-
 
             # 3. Strategy SELL
             elif signal == "SELL" and in_position:
@@ -69,9 +76,11 @@ def run(monitor: Monitor, run_id: str | None) -> None:
             msg = f"Error processing {symbol}: {e}"
             log_error(msg, run_id)
             monitor.log_error(run_id, f"engine/{symbol}", str(e))
-            # Continue to next symbol — one bad symbol must not stop the rest
 
-    # ── Save state back to disk ───────────────────────────────────────────────
+    # ── Save state ────────────────────────────────────────────────────────────
     save_state(state)
-    log(f"State saved — capital={state['capital']:.2f} "
-        f"open_positions={list(state['positions'].keys())}", run_id)
+    log(
+        f"State saved — capital={state['capital']:.2f} "
+        f"open_positions={list(state['positions'].keys())}",
+        run_id,
+    )
