@@ -2,7 +2,7 @@
 #
 # Schema:
 # {
-#   "capital": 50.0,
+#   "capital": 30.0,
 #   "positions": {
 #     "BTC": {"entry": 67000.0, "usd_amount": 33.33, "size_estimate": 0.000498,
 #             "stop_loss": 64990.0, "take_profit": 70350.0, "order_id": "..."}

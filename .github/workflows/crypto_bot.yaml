@@ -1,4 +1,6 @@
 # .github/workflows/crypto_bot.yml
+# LIVE MODE — DRY_RUN=0
+# Real orders will be placed when EMA crossover fires.
 
 name: Crypto Bot
 
@@ -19,7 +21,7 @@ jobs:
       STOP_LOSS_PCT: "0.03"
       TAKE_PROFIT_PCT: "0.05"
       RUN_ONCE: "1"
-      DRY_RUN: "1"           # set to "0" when ready for live trading
+      DRY_RUN: "0"
       PUBLIC_SECRET: ${{ secrets.PUBLIC_SECRET }}
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
@@ -28,7 +30,6 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # Restore: match any previously saved state for this branch
       - name: Restore bot state
         uses: actions/cache/restore@v4
         with:
@@ -36,9 +37,16 @@ jobs:
           key: crypto-bot-state-${{ github.ref_name }}-${{ github.run_id }}
           restore-keys: |
             crypto-bot-state-${{ github.ref_name }}-
-      
-      - name: Debug state
-        run: cat state.json
+
+      - name: Fix capital
+        run: |
+          python -c "
+          import json
+          with open('state.json') as f: s = json.load(f)
+          s['capital'] = 30.0
+          with open('state.json', 'w') as f: json.dump(s, f, indent=2)
+          print('Capital set to:', s['capital'])
+          "
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -52,8 +60,6 @@ jobs:
       - name: Run bot
         run: python main.py
 
-      # Save: always use a unique key (run_id) so the save never collides
-      # with an existing immutable cache entry and silently fails.
       - name: Save bot state
         if: always()
         uses: actions/cache/save@v4
