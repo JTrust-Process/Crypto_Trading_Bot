@@ -14,7 +14,7 @@ jobs:
 
     env:
       SYMBOLS: "BTC,ETH"
-      INITIAL_CAPITAL: "50"
+      INITIAL_CAPITAL: "30"
       RISK_PER_TRADE: "0.02"
       STOP_LOSS_PCT: "0.03"
       TAKE_PROFIT_PCT: "0.05"
@@ -36,6 +36,9 @@ jobs:
           key: crypto-bot-state-${{ github.ref_name }}-${{ github.run_id }}
           restore-keys: |
             crypto-bot-state-${{ github.ref_name }}-
+      
+      - name: Debug state
+        run: cat state.json
 
       - name: Set up Python
         uses: actions/setup-python@v5
