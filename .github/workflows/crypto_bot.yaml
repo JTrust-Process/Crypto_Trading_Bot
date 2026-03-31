@@ -50,6 +50,13 @@ jobs:
       - name: Run bot
         run: python main.py
 
+      - name: Upload state as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-state
+          path: state.json
+          
       - name: Save bot state
         if: always()
         uses: actions/cache/save@v4
