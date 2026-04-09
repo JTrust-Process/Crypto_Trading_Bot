@@ -16,7 +16,7 @@ jobs:
 
     env:
       SYMBOLS: "BTC,ETH"
-      INITIAL_CAPITAL: "30"
+      INITIAL_CAPITAL: "15"
       RISK_PER_TRADE: "0.02"
       STOP_LOSS_PCT: "0.03"
       TAKE_PROFIT_PCT: "0.05"
@@ -37,7 +37,7 @@ jobs:
           key: crypto-bot-state-${{ github.ref_name }}-${{ github.run_id }}
           restore-keys: |
             crypto-bot-state-${{ github.ref_name }}-
-              
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -50,13 +50,6 @@ jobs:
       - name: Run bot
         run: python main.py
 
-      - name: Upload state as artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: bot-state
-          path: state.json
-          
       - name: Save bot state
         if: always()
         uses: actions/cache/save@v4

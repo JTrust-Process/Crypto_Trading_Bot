@@ -8,11 +8,11 @@ import os
 # ── Hardcoded non-secrets ─────────────────────────────────────────────────────
 SYMBOLS             = ["BTC", "ETH"]
 POLL_INTERVAL       = 900           # 15 min (matches GHA schedule)
-INITIAL_CAPITAL     = 30.0          # USD
+INITIAL_CAPITAL     = 15.0          # USD
 RISK_PER_TRADE      = 0.02          # 2% of capital per trade
 STOP_LOSS_PCT       = 0.03          # 3%
 TAKE_PROFIT_PCT     = 0.05          # 5%
-PRICE_HISTORY_SIZE  = 30            # rolling candles kept in state.json
+PRICE_HISTORY_SIZE  = 50            # rolling candles kept in state.json
 EMA_FAST            = 9             # fast EMA period
 EMA_SLOW            = 21            # slow EMA period
 STATE_FILE          = "state.json"
