@@ -90,6 +90,16 @@ def run(monitor: Monitor, run_id: str | None) -> None:
             if not dry_run:
                 discord.notify_error(f"engine/{symbol}", str(e))
 
+    # ── Daily summary ────────────────────────────────────────────────────────
+    if not dry_run and discord.should_send_daily_summary(state):
+        discord.notify_daily_summary(
+            state=state,
+            symbols=symbols,
+            price_history=state.get("price_history", {}),
+            dry_run=dry_run,
+        )
+        log("Daily Discord summary sent", run_id)
+
     # ── Save state ────────────────────────────────────────────────────────────
     save_state(state)
     log(

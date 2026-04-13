@@ -28,6 +28,7 @@ def _default_state() -> dict:
         "positions":          {},
         "price_history":      {},
         "consecutive_losses": {},
+        "last_daily_summary": "",
     }
 
 
@@ -41,6 +42,7 @@ def load_state() -> dict:
         data.setdefault("positions",          {})
         data.setdefault("price_history",      {})
         data.setdefault("consecutive_losses", {})
+        data.setdefault("last_daily_summary", "")
         return data
     except (json.JSONDecodeError, OSError):
         return _default_state()
