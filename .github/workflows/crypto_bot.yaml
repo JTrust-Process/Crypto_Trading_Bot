@@ -1,6 +1,5 @@
 # .github/workflows/crypto_bot.yml
 # LIVE MODE — DRY_RUN=0
-# Real orders will be placed when EMA crossover fires.
 
 name: Crypto Bot
 
@@ -15,16 +14,22 @@ jobs:
     timeout-minutes: 10
 
     env:
+      # ── Non-secrets ───────────────────────────────────────────────────────
       SYMBOLS: "BTC,ETH"
       INITIAL_CAPITAL: "15"
       RISK_PER_TRADE: "0.02"
       STOP_LOSS_PCT: "0.03"
       TAKE_PROFIT_PCT: "0.05"
+      MAX_ORDER_AMOUNT_USD: "10"      # hard cap per trade
+      CIRCUIT_BREAKER_LOSSES: "3"    # pause symbol after 3 consecutive losses
       RUN_ONCE: "1"
       DRY_RUN: "0"
+
+      # ── Secrets ───────────────────────────────────────────────────────────
       PUBLIC_SECRET: ${{ secrets.PUBLIC_SECRET }}
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
 
     steps:
       - name: Checkout repo
