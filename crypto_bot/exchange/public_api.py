@@ -1,7 +1,4 @@
 # crypto_bot/exchange/public_api.py
-#
-# URLs taken directly from the working stock bot.
-# Crypto symbols use bare format: "BTC", "ETH" with type="CRYPTO"
 
 import uuid
 import requests
@@ -30,7 +27,6 @@ def _raise_with_body(resp: requests.Response) -> None:
 
 @retry(max_attempts=3, delay=2)
 def get_access_token(validity_minutes: int = 60) -> str:
-    """Exchange secret key for a temporary access token. Cached per process."""
     global _access_token
     if _access_token is not None:
         return _access_token
@@ -76,10 +72,6 @@ def get_primary_account_id() -> str:
 
 @retry(max_attempts=3, delay=2)
 def get_quotes(account_id: str, symbols: list[str]) -> list[dict]:
-    """
-    POST /userapigateway/marketdata/{accountId}/quotes
-    symbols = ["BTC", "ETH"] — bare format confirmed working.
-    """
     url = QUOTES_URL_TMPL.format(accountId=account_id)
     body = {
         "instruments": [
@@ -92,13 +84,8 @@ def get_quotes(account_id: str, symbols: list[str]) -> list[dict]:
 
 
 def get_crypto_prices(symbols: list[str]) -> dict[str, float]:
-    """
-    Returns {"BTC": 67000.0, "ETH": 2300.5}
-    symbols = ["BTC", "ETH"]
-    """
     acct_id = get_primary_account_id()
     quotes = get_quotes(acct_id, symbols)
-
     prices = {}
     for q in quotes:
         sym = q.get("instrument", {}).get("symbol")
@@ -108,43 +95,59 @@ def get_crypto_prices(symbols: list[str]) -> dict[str, float]:
                 prices[sym] = float(last)
             except (ValueError, TypeError):
                 pass
-
     return prices
 
 
 # ── Order placement ───────────────────────────────────────────────────────────
 
 @retry(max_attempts=3, delay=2)
-def place_order(
+def place_order_buy(
     account_id: str,
     symbol: str,
-    side: str,
-    amount: float,
+    amount_usd: float,
     order_type: str = "MARKET",
 ) -> dict:
     """
-    POST /userapigateway/trading/{accountId}/order
-
-    Args:
-        account_id: from get_primary_account_id()
-        symbol:     bare crypto symbol e.g. "BTC", "ETH"
-        side:       "BUY" or "SELL"
-        amount:     notional USD value e.g. 10.00
-        order_type: "MARKET" (default)
-
-    Returns:
-        { "orderId": "uuid...", "_clientOrderId": "uuid..." }
-        Order placement is async — use get_order() to poll for fill status.
+    BUY using notional USD amount — e.g. spend $10 of BTC.
+    Public accepts `amount` for buys.
     """
     url = ORDER_URL_TMPL.format(accountId=account_id)
     order_id = str(uuid.uuid4())
     body = {
         "orderId": order_id,
         "instrument": {"symbol": symbol, "type": INSTRUMENT_TYPE},
-        "orderSide": side.upper(),
+        "orderSide": "BUY",
         "orderType": order_type.upper(),
         "expiration": {"timeInForce": "DAY"},
-        "amount": str(round(amount, 2)),
+        "amount": str(round(amount_usd, 2)),
+    }
+    resp = requests.post(url, headers=_headers(), json=body, timeout=30)
+    _raise_with_body(resp)
+    result = resp.json()
+    result["_clientOrderId"] = order_id
+    return result
+
+
+@retry(max_attempts=3, delay=2)
+def place_order_sell(
+    account_id: str,
+    symbol: str,
+    quantity: float,
+    order_type: str = "MARKET",
+) -> dict:
+    """
+    SELL using exact quantity — e.g. sell 0.000138 BTC.
+    Public requires `quantity` for sells when closing a position.
+    """
+    url = ORDER_URL_TMPL.format(accountId=account_id)
+    order_id = str(uuid.uuid4())
+    body = {
+        "orderId": order_id,
+        "instrument": {"symbol": symbol, "type": INSTRUMENT_TYPE},
+        "orderSide": "SELL",
+        "orderType": order_type.upper(),
+        "expiration": {"timeInForce": "DAY"},
+        "quantity": str(round(quantity, 8)),
     }
     resp = requests.post(url, headers=_headers(), json=body, timeout=30)
     _raise_with_body(resp)
@@ -155,7 +158,7 @@ def place_order(
 
 @retry(max_attempts=3, delay=2)
 def get_order(account_id: str, order_id: str) -> dict:
-    """Poll for order fill status after place_order()."""
+    """Poll for order fill status after placing an order."""
     url = f"https://api.public.com/userapigateway/trading/{account_id}/order/{order_id}"
     resp = requests.get(url, headers=_headers(), timeout=30)
     _raise_with_body(resp)

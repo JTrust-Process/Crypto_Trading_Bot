@@ -1,10 +1,16 @@
 # crypto_bot/execution/trader.py
 #
-# DRY_RUN=1 → skips place_order(), logs trade to Supabase with reason
-# prefixed "DRY_RUN/" so paper trades are clearly distinguishable in the DB
-# but live in the same crypto_trades table.
+# BUY  → place_order_buy(amount_usd)   — notional USD, Public uses `amount`
+# SELL → place_order_sell(quantity)    — exact units,  Public uses `quantity`
+#
+# This split is required by Public's API: selling by notional amount
+# fails with HTTP 400 when the position value is close to the order value.
 
-from crypto_bot.exchange.public_api import get_primary_account_id, place_order
+from crypto_bot.exchange.public_api import (
+    get_primary_account_id,
+    place_order_buy,
+    place_order_sell,
+)
 from crypto_bot.logging import supabase_logger
 from crypto_bot.logging.logger import log, log_error
 from crypto_bot.config.settings import STOP_LOSS_PCT, TAKE_PROFIT_PCT, is_dry_run
@@ -28,33 +34,23 @@ class Trader:
             self._account_id = get_primary_account_id()
         return self._account_id
 
-    def _place(self, symbol: str, side: str, amount: float) -> bool:
-        """
-        Execute or simulate an order.
-        Returns True on success, False on failure.
-        In DRY_RUN mode, always returns True without hitting the API.
-        """
-        if self._dry_run:
-            log(f"[DRY RUN] Would place {side} {symbol} ${amount:.2f}", self.run_id)
-            return True
-        try:
-            place_order(self._get_account_id(), symbol, side, amount)
-            return True
-        except Exception as e:
-            log_error(f"[trader] place_order {side} {symbol} failed: {e}", self.run_id)
-            return False
-
     def buy(self, symbol: str, price: float, usd_amount: float) -> None:
-        if not self._place(symbol, "BUY", usd_amount):
-            return
+        if self._dry_run:
+            log(f"[DRY RUN] Would BUY {symbol} ${usd_amount:.2f}", self.run_id)
+        else:
+            try:
+                place_order_buy(self._get_account_id(), symbol, usd_amount)
+            except Exception as e:
+                log_error(f"[trader] BUY {symbol} failed: {e}", self.run_id)
+                return
 
         size_estimate = usd_amount / price
         self.positions[symbol] = {
-            "entry": price,
-            "usd_amount": usd_amount,
+            "entry":       price,
+            "usd_amount":  usd_amount,
             "size_estimate": size_estimate,
-            "stop_loss":    round(price * (1 - STOP_LOSS_PCT), 6),
-            "take_profit":  round(price * (1 + TAKE_PROFIT_PCT), 6),
+            "stop_loss":   round(price * (1 - STOP_LOSS_PCT), 6),
+            "take_profit": round(price * (1 + TAKE_PROFIT_PCT), 6),
         }
 
         mode = "DRY RUN " if self._dry_run else ""
@@ -73,20 +69,27 @@ class Trader:
             return
 
         pos = self.positions[symbol]
-        usd_amount = pos["usd_amount"]
+        usd_amount   = pos["usd_amount"]
         size_estimate = pos.get("size_estimate", usd_amount / pos["entry"])
         pnl = (price / pos["entry"] - 1) * usd_amount
 
-        full_reason = f"DRY_RUN/{reason}" if self._dry_run else reason
-        if not self._place(symbol, "SELL", usd_amount):
-            return
+        if self._dry_run:
+            log(f"[DRY RUN] Would SELL {symbol} qty={size_estimate:.8f}", self.run_id)
+        else:
+            try:
+                # SELL by quantity — required by Public API when closing positions
+                place_order_sell(self._get_account_id(), symbol, size_estimate)
+            except Exception as e:
+                log_error(f"[trader] SELL {symbol} failed: {e}", self.run_id)
+                return
 
         mode = "DRY RUN " if self._dry_run else ""
         log(
-            f"{mode}SELL {symbol} | price={price:.2f} | amount=${usd_amount:.2f} | "
+            f"{mode}SELL {symbol} | price={price:.2f} | qty={size_estimate:.8f} | "
             f"pnl={pnl:+.4f} | reason={reason}",
             self.run_id,
         )
+        full_reason = f"DRY_RUN/{reason}" if self._dry_run else reason
         supabase_logger.log_trade(symbol, "SELL", price, size_estimate, pnl, full_reason, self.run_id)
 
         self.state["capital"] += pnl
