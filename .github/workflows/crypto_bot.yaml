@@ -47,19 +47,6 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Run bot
-        run: python main.py
-
-      - name: Save bot state
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: state.json
-          key: crypto-bot-state-${{ github.ref_name }}-${{ github.run_id }}
-      
       - name: Fix ETH position size
         run: |
           python -c "
@@ -75,6 +62,19 @@ jobs:
               json.dump(s, f, indent=2)
           print('State:', s['positions'])
           "
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run bot
+        run: python main.py
+
+      - name: Save bot state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: crypto-bot-state-${{ github.ref_name }}-${{ github.run_id }}
 
       # Upload state.json as a downloadable artifact after every run.
       # Lets you inspect current capital, positions, price history, and
