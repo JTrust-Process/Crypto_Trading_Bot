@@ -152,7 +152,13 @@ class Trader:
 
         pos           = self.positions[symbol]
         usd_amount    = pos["usd_amount"]
-        size_estimate = pos.get("size_estimate", usd_amount / pos["entry"])
+        size_estimate = pos.get("size_estimate", 0)
+
+        # Guard against zero/missing size — recalculate from entry if needed
+        if not size_estimate or size_estimate <= 0:
+            size_estimate = usd_amount / pos["entry"]
+            log_warn(f"[trader] {symbol} size_estimate was 0 — recalculated as {size_estimate:.8f} from entry", self.run_id)
+
         fill_price    = price  # default to quote price
 
         if self._dry_run:
