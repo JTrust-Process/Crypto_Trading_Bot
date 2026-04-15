@@ -110,9 +110,14 @@ class Trader:
 
                 # Poll for real fill price
                 if order_id:
-                    fill_price, _ = _poll_fill_price(self._get_account_id(), order_id, price)
-                    if fill_price != price:
-                        log(f"[trader] BUY {symbol} fill price {fill_price:.2f} (quote was {price:.2f})", self.run_id)
+                    raw_fill, _ = _poll_fill_price(self._get_account_id(), order_id, price)
+                    if raw_fill > 0:
+                        fill_price = raw_fill
+                        if fill_price != price:
+                            log(f"[trader] BUY {symbol} fill price {fill_price:.2f} (quote was {price:.2f})", self.run_id)
+                    else:
+                        log_warn(f"[trader] BUY {symbol} fill price from API was invalid ({raw_fill:.2f}) — using quote price {price:.2f}", self.run_id)
+                        fill_price = price
 
             except Exception as e:
                 log_error(f"[trader] BUY {symbol} failed: {e}", self.run_id)
@@ -170,9 +175,14 @@ class Trader:
 
                 # Poll for real fill price
                 if order_id:
-                    fill_price, filled_qty = _poll_fill_price(self._get_account_id(), order_id, price)
-                    if fill_price != price:
-                        log(f"[trader] SELL {symbol} fill price {fill_price:.2f} (quote was {price:.2f})", self.run_id)
+                    raw_fill, filled_qty = _poll_fill_price(self._get_account_id(), order_id, price)
+                    if raw_fill > 0:
+                        fill_price = raw_fill
+                        if fill_price != price:
+                            log(f"[trader] SELL {symbol} fill price {fill_price:.2f} (quote was {price:.2f})", self.run_id)
+                    else:
+                        log_warn(f"[trader] SELL {symbol} fill price from API was invalid ({raw_fill:.2f}) — using quote price {price:.2f}", self.run_id)
+                        fill_price = price
                     # Use actual filled quantity if available for more accurate P&L
                     if filled_qty > 0:
                         size_estimate = filled_qty
