@@ -163,3 +163,35 @@ def get_order(account_id: str, order_id: str) -> dict:
     resp = requests.get(url, headers=_headers(), timeout=30)
     _raise_with_body(resp)
     return resp.json()
+
+
+# ── Portfolio / buying power ───────────────────────────────────────────────────
+
+@retry(max_attempts=3, delay=2)
+def get_portfolio(account_id: str) -> dict:
+    """
+    GET /userapigateway/trading/{accountId}/portfolio/v2
+    Returns full portfolio including buyingPower and positions.
+    """
+    url = f"https://api.public.com/userapigateway/trading/{account_id}/portfolio/v2"
+    resp = requests.get(url, headers=_headers(), timeout=30)
+    _raise_with_body(resp)
+    return resp.json()
+
+
+def get_cash_buying_power(account_id: str) -> float:
+    """
+    Returns available cash buying power in USD.
+    Uses cashOnlyBuyingPower to avoid trading on margin.
+    Falls back to 0.0 if unavailable.
+    """
+    try:
+        portfolio = get_portfolio(account_id)
+        bp = portfolio.get("buyingPower", {})
+        for key in ("cashOnlyBuyingPower", "buyingPower", "availableBuyingPower"):
+            val = bp.get(key)
+            if val is not None:
+                return float(val)
+    except Exception as e:
+        print(f"[public_api] get_cash_buying_power failed: {e}")
+    return 0.0
