@@ -72,3 +72,16 @@ def get_price_history_size() -> int:
         return int(raw) if raw else PRICE_HISTORY_SIZE
     except ValueError:
         return PRICE_HISTORY_SIZE
+
+# ── Buying power safety ───────────────────────────────────────────────────────
+# Minimum cash buying power that must remain AFTER the order.
+# Prevents the bot from spending every last dollar and triggering
+# a margin maintenance call when both bots are active simultaneously.
+MIN_BUYING_POWER_BUFFER = 25.0  # always keep at least $25 free
+
+def get_min_buying_power_buffer() -> float:
+    raw = os.getenv("MIN_BUYING_POWER_BUFFER")
+    try:
+        return float(raw) if raw else MIN_BUYING_POWER_BUFFER
+    except ValueError:
+        return MIN_BUYING_POWER_BUFFER
