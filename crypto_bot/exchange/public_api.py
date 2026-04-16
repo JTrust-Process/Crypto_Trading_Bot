@@ -195,3 +195,26 @@ def get_cash_buying_power(account_id: str) -> float:
     except Exception as e:
         print(f"[public_api] get_cash_buying_power failed: {e}")
     return 0.0
+
+
+def get_crypto_position_quantity(account_id: str, symbol: str) -> float | None:
+    """
+    Returns the actual quantity of a crypto position held in the account.
+    Uses portfolio/v2 to get the real filled quantity from Public.
+    Returns None if position not found or on error.
+
+    This is used before selling to ensure we never try to sell more
+    than we actually hold, avoiding "would result in short position" errors.
+    """
+    try:
+        portfolio = get_portfolio(account_id)
+        for pos in (portfolio.get("positions") or []):
+            inst = pos.get("instrument") or {}
+            if (inst.get("type") == "CRYPTO" and
+                    inst.get("symbol", "").upper() == symbol.upper()):
+                qty = pos.get("quantity")
+                if qty is not None:
+                    return float(qty)
+    except Exception as e:
+        print(f"[public_api] get_crypto_position_quantity failed: {e}")
+    return None

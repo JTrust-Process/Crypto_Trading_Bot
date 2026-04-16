@@ -18,6 +18,7 @@ from crypto_bot.exchange.public_api import (
     place_order_sell,
     get_order,
     get_cash_buying_power,
+    get_crypto_position_quantity,
 )
 from crypto_bot.logging import supabase_logger
 from crypto_bot.logging.logger import log, log_error, log_warn
@@ -169,6 +170,25 @@ class Trader:
         if self._dry_run:
             log(f"[DRY RUN] Would SELL {symbol} qty={size_estimate:.8f}", self.run_id)
         else:
+            # Fetch actual position quantity from Public before selling.
+            # Our size_estimate may differ from actual fill due to fees/rounding
+            # or bad fill price data — using the real quantity prevents
+            # "would result in short position" rejections.
+            try:
+                real_qty = get_crypto_position_quantity(self._get_account_id(), symbol)
+                if real_qty is not None and real_qty > 0:
+                    if abs(real_qty - size_estimate) / size_estimate > 0.01:
+                        log_warn(
+                            f"[trader] {symbol} size_estimate {size_estimate:.8f} differs from "
+                            f"actual position {real_qty:.8f} — using real quantity",
+                            self.run_id,
+                        )
+                    size_estimate = real_qty
+                else:
+                    log_warn(f"[trader] Could not fetch real {symbol} quantity — using estimate {size_estimate:.8f}", self.run_id)
+            except Exception as e:
+                log_warn(f"[trader] Portfolio quantity check failed: {e} — using estimate", self.run_id)
+
             try:
                 result   = place_order_sell(self._get_account_id(), symbol, size_estimate)
                 order_id = result.get("orderId") or result.get("_clientOrderId")
