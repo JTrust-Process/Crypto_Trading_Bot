@@ -136,6 +136,8 @@ class Trader:
             "size_estimate": size_estimate,
             "stop_loss":     sl,
             "take_profit":   tp,
+            # Track candle count at entry for minimum hold time check
+            "entry_candle":  len(self.state["price_history"].get(symbol, [])),
         }
 
         mode = "DRY RUN " if self._dry_run else ""

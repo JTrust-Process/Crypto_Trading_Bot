@@ -22,6 +22,10 @@ jobs:
       MAX_ORDER_AMOUNT_USD: "10"
       MIN_BUYING_POWER_BUFFER: "25"  # always keep $25 free across both bots
       CIRCUIT_BREAKER_LOSSES: "3"
+      # ── Signal quality filters (avoid whipsaws & fee losses) ──
+      MIN_SIGNAL_GAP_PCT: "0.0015"    # 0.15% EMA gap required for BUY
+      MIN_SIGNAL_PROFIT_PCT: "0.003"  # 0.3% profit required for signal SELL
+      MIN_HOLD_CANDLES: "4"           # 1hr min hold before signal exit
       RUN_ONCE: "1"
       DRY_RUN: "0"
       PUBLIC_SECRET: ${{ secrets.PUBLIC_SECRET }}
@@ -46,26 +50,6 @@ jobs:
         with:
           python-version: "3.11"
           cache: "pip"
-
-      - name: Fix ETH position
-        run: |
-          python -c "
-          import json
-          with open('state.json') as f:
-              s = json.load(f)
-          pos = s.get('positions', {}).get('ETH')
-          if pos:
-              print('Before:', pos)
-              # Entry was stored as negative due to bad API fill price
-              # Fix by using abs value — $2339.84 was the actual fill
-              pos['entry']         = abs(pos['entry'])
-              pos['stop_loss']     = round(pos['entry'] * 0.97, 6)
-              pos['take_profit']   = round(pos['entry'] * 1.05, 6)
-              pos['size_estimate'] = pos['usd_amount'] / pos['entry']
-              print('After:', pos)
-          with open('state.json', 'w') as f:
-              json.dump(s, f, indent=2)
-          "
 
       - name: Install dependencies
         run: pip install -r requirements.txt

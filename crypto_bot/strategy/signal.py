@@ -1,13 +1,7 @@
 # crypto_bot/strategy/signal.py
 #
-# EMA 9/21 crossover strategy operating on real rolling price history
-# stored in state.json across GitHub Actions runs.
-#
-# Each run appends one new price → after 21 runs the slow EMA is meaningful,
-# after 50 runs the full history window is populated and signals are reliable.
-#
-# During the warmup period (< EMA_SLOW prices) the signal is always HOLD
-# so the bot never trades on incomplete data.
+# EMA 9/21 crossover with gap quality filter.
+# Returns (signal, gap_pct) so the engine can decide whether to act.
 
 from crypto_bot.config.settings import EMA_FAST, EMA_SLOW
 
@@ -20,48 +14,36 @@ def ema(values: list[float], period: int) -> list[float]:
     return result
 
 
-def generate_signal(prices: list[float], in_position: bool) -> str:
+def generate_signal(prices: list[float], in_position: bool) -> tuple[str, float]:
     """
-    EMA crossover signal from real rolling price history.
-
-    Args:
-        prices:      list of close prices in chronological order,
-                     sourced from state["price_history"][symbol]
-        in_position: True if the bot currently holds this symbol
-
-    Returns:
-        "BUY"  — EMA fast crossed above EMA slow, not in position
-        "SELL" — EMA fast crossed below EMA slow, currently in position
-        "HOLD" — warmup period or no crossover
-
-    Warmup: returns HOLD until we have at least EMA_SLOW + 1 prices so
-    both EMAs have enough data to be meaningful.
+    Returns (signal, gap_pct).
+      signal:  "BUY" | "SELL" | "HOLD"
+      gap_pct: |EMA9 - EMA21| / price — how strong the separation is.
+               Used by engine to filter weak signals.
     """
     if len(prices) < EMA_SLOW + 1:
-        runs_needed = (EMA_SLOW + 1) - len(prices)
-        return "HOLD"  # still warming up
+        return "HOLD", 0.0
 
     ema_fast = ema(prices, EMA_FAST)
     ema_slow = ema(prices, EMA_SLOW)
 
-    # Current and previous values to detect a crossover
     fast_now,  slow_now  = ema_fast[-1],  ema_slow[-1]
     fast_prev, slow_prev = ema_fast[-2],  ema_slow[-2]
 
-    # Crossover UP: fast crossed above slow this candle
     crossed_up   = fast_prev <= slow_prev and fast_now > slow_now
-    # Crossover DOWN: fast crossed below slow this candle
     crossed_down = fast_prev >= slow_prev and fast_now < slow_now
 
-    if not in_position and crossed_up:
-        return "BUY"
-    if in_position and crossed_down:
-        return "SELL"
+    current_price = prices[-1]
+    gap_pct = abs(fast_now - slow_now) / current_price if current_price else 0.0
 
-    return "HOLD"
+    if not in_position and crossed_up:
+        return "BUY", gap_pct
+    if in_position and crossed_down:
+        return "SELL", gap_pct
+
+    return "HOLD", gap_pct
 
 
 def warmup_progress(prices: list[float]) -> str:
-    """Human-readable warmup status for logging e.g. '14/22 prices'."""
     needed = EMA_SLOW + 1
     return f"{len(prices)}/{needed} prices collected"

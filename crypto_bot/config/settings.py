@@ -85,3 +85,24 @@ def get_min_buying_power_buffer() -> float:
         return float(raw) if raw else MIN_BUYING_POWER_BUFFER
     except ValueError:
         return MIN_BUYING_POWER_BUFFER
+
+# ── Signal quality filters ────────────────────────────────────────────────────
+# These only affect signal-based entries/exits, never SL/TP hard exits.
+MIN_SIGNAL_GAP_PCT     = 0.0015   # 0.15% — EMA gap / price must exceed this for BUY
+MIN_SIGNAL_PROFIT_PCT  = 0.003    # 0.3%  — signal SELL must be this profitable (covers ~$0.12 fees on $10 trade)
+MIN_HOLD_CANDLES       = 4        # block signal exits until position is 4 candles old (1hr at 15min)
+
+def get_min_signal_gap_pct() -> float:
+    raw = os.getenv("MIN_SIGNAL_GAP_PCT")
+    try: return float(raw) if raw else MIN_SIGNAL_GAP_PCT
+    except ValueError: return MIN_SIGNAL_GAP_PCT
+
+def get_min_signal_profit_pct() -> float:
+    raw = os.getenv("MIN_SIGNAL_PROFIT_PCT")
+    try: return float(raw) if raw else MIN_SIGNAL_PROFIT_PCT
+    except ValueError: return MIN_SIGNAL_PROFIT_PCT
+
+def get_min_hold_candles() -> int:
+    raw = os.getenv("MIN_HOLD_CANDLES")
+    try: return int(raw) if raw else MIN_HOLD_CANDLES
+    except ValueError: return MIN_HOLD_CANDLES
