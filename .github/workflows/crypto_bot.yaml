@@ -19,12 +19,12 @@ jobs:
       RISK_PER_TRADE: "0.02"
       STOP_LOSS_PCT: "0.03"
       TAKE_PROFIT_PCT: "0.05"
-      MAX_ORDER_AMOUNT_USD: "10"
+      MAX_ORDER_AMOUNT_USD: "25"
       MIN_BUYING_POWER_BUFFER: "25"  # always keep $25 free across both bots
       CIRCUIT_BREAKER_LOSSES: "3"
       # ── Signal quality filters (avoid whipsaws & fee losses) ──
       MIN_SIGNAL_GAP_PCT: "0.0015"    # 0.15% EMA gap required for BUY
-      MIN_SIGNAL_PROFIT_PCT: "0.003"  # 0.3% profit required for signal SELL
+      MIN_SIGNAL_PROFIT_PCT: "0.03"   # 3% profit required for signal SELL (covers fees)
       MIN_HOLD_CANDLES: "4"           # 1hr min hold before signal exit
       RUN_ONCE: "1"
       DRY_RUN: "0"
