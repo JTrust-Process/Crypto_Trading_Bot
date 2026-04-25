@@ -1,13 +1,10 @@
 # crypto_bot/notifications/discord.py
 #
-# Sends rich embed messages to a Discord webhook.
-# Never crashes the bot — all calls wrapped in try/except.
-#
-# Setup:
-#   1. Discord server → channel settings → Integrations → Webhooks → New Webhook
-#   2. Copy webhook URL → add as DISCORD_WEBHOOK_URL in GitHub Secrets + .env
+# Fix from audit:
+#   - Issue 8: webhook send now retries on HTTP 429 with Retry-After backoff
 
 import os
+import time
 import requests
 from datetime import datetime, timezone
 
@@ -32,15 +29,44 @@ def _now() -> str:
 
 
 def _today_key() -> str:
-    """Returns today's date as YYYY-MM-DD in UTC."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
+def _post_with_retry(url: str, payload: dict, max_attempts: int = 3) -> None:
+    """
+    POST to webhook with retry on rate limits.
+    Issue 8: Discord returns 429 + Retry-After header when rate-limited.
+    Without this, simultaneous BUY+SELL+daily summary in one cycle could
+    silently drop messages.
+    """
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests.post(url, json=payload, timeout=10)
+            if resp.status_code in (200, 204):
+                return
+            if resp.status_code == 429:
+                retry_after = float(resp.headers.get("Retry-After", "1"))
+                # Discord returns ms in some cases via JSON body
+                try:
+                    body = resp.json()
+                    retry_after = max(retry_after, float(body.get("retry_after", 0)))
+                except Exception:
+                    pass
+                if attempt < max_attempts:
+                    print(f"[discord] Rate limited — sleeping {retry_after:.1f}s")
+                    time.sleep(retry_after)
+                    continue
+            print(f"[discord] Webhook returned {resp.status_code}: {resp.text[:200]}")
+            return
+        except Exception as e:
+            if attempt < max_attempts:
+                time.sleep(2)
+            else:
+                print(f"[discord] Failed to send notification: {e}")
+
+
 def send(event: str, title: str, fields: dict, description: str = "") -> None:
-    """
-    Send a rich embed to Discord.
-    Never raises — silently logs on failure.
-    """
+    """Send a rich embed to Discord. Never raises — silently logs on failure."""
     url = _get_webhook_url()
     if not url:
         return
@@ -50,24 +76,16 @@ def send(event: str, title: str, fields: dict, description: str = "") -> None:
     embed = {
         "title": f"{emoji}  {title}",
         "color": color,
-        "fields": [
-            {"name": k, "value": str(v), "inline": True}
-            for k, v in fields.items()
-        ],
+        "fields": [{"name": k, "value": str(v), "inline": True} for k, v in fields.items()],
         "footer": {"text": f"Crypto Bot  ·  {_now()}"},
     }
     if description:
         embed["description"] = description
 
-    try:
-        resp = requests.post(url, json={"embeds": [embed]}, timeout=10)
-        if resp.status_code not in (200, 204):
-            print(f"[discord] Webhook returned {resp.status_code}: {resp.text[:200]}")
-    except Exception as e:
-        print(f"[discord] Failed to send notification: {e}")
+    _post_with_retry(url, {"embeds": [embed]})
 
 
-# ── Trade notifications ───────────────────────────────────────────────────────
+# ── Convenience wrappers ──────────────────────────────────────────────────────
 
 def notify_buy(symbol: str, price: float, usd_amount: float, sl: float, tp: float) -> None:
     send("buy", f"Buy {symbol}", {
@@ -111,31 +129,15 @@ def notify_error(context: str, error: str) -> None:
 # ── Daily summary ─────────────────────────────────────────────────────────────
 
 def should_send_daily_summary(state: dict) -> bool:
-    """
-    Returns True if we haven't sent a daily summary today yet.
-    Uses state['last_daily_summary'] to track last sent date (UTC).
-    Only sends once per day — the first run after midnight UTC fires it.
-    """
-    last_sent = state.get("last_daily_summary", "")
-    return last_sent != _today_key()
+    return state.get("last_daily_summary", "") != _today_key()
 
 
 def notify_daily_summary(
     state: dict,
-    symbols: list[str],
+    symbols: list,
     price_history: dict,
     dry_run: bool,
 ) -> None:
-    """
-    Send a daily summary embed and record today's date in state so it
-    doesn't fire again until tomorrow.
-
-    Includes:
-      - Capital and open positions
-      - EMA gap per symbol (how far from crossover)
-      - Today's trades count
-      - Bot mode (live / dry run)
-    """
     capital   = state.get("capital", 0)
     positions = state.get("positions", {})
     losses    = state.get("consecutive_losses", {})
@@ -146,16 +148,13 @@ def notify_daily_summary(
         "Positions": ", ".join(positions.keys()) if positions else "None",
     }
 
-    # EMA gap per symbol
     for sym in symbols:
         prices = price_history.get(sym, [])
         if len(prices) >= 22:
-            k9  = 2 / 10
-            k21 = 2 / 22
-            ema9  = [prices[0]]
-            ema21 = [prices[0]]
+            k9, k21 = 2 / 10, 2 / 22
+            ema9, ema21 = [prices[0]], [prices[0]]
             for p in prices[1:]:
-                ema9.append(p  * k9  + ema9[-1]  * (1 - k9))
+                ema9.append(p * k9 + ema9[-1] * (1 - k9))
                 ema21.append(p * k21 + ema21[-1] * (1 - k21))
             gap = ema9[-1] - ema21[-1]
             direction = "↑ bullish" if gap > 0 else "↓ bearish"
@@ -163,26 +162,18 @@ def notify_daily_summary(
         else:
             fields[f"{sym} EMA"] = f"Warming up ({len(prices)}/22)"
 
-        # Current price
         if prices:
             fields[f"{sym} Price"] = f"${prices[-1]:,.2f}"
 
-        # Consecutive losses
         l = losses.get(sym, 0)
         if l > 0:
             fields[f"{sym} Loss streak"] = f"{l} ⚠️"
 
-    # Open position details
     for sym, pos in positions.items():
         fields[f"{sym} Entry"] = f"${pos['entry']:,.2f}"
         fields[f"{sym} SL/TP"] = f"${pos['stop_loss']:,.2f} / ${pos['take_profit']:,.2f}"
 
-    send(
-        "daily_summary",
-        "Daily Summary",
-        fields,
-        description=f"24-hour bot status as of {_now()}",
-    )
+    send("daily_summary", "Daily Summary", fields,
+         description=f"24-hour bot status as of {_now()}")
 
-    # Record that we sent today so it doesn't fire again until tomorrow
     state["last_daily_summary"] = _today_key()

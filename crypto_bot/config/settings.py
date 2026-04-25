@@ -2,25 +2,34 @@
 #
 # NO os.getenv() calls at module level.
 # All values read lazily after load_dotenv() runs in __main__.
+#
+# Fixes from audit:
+#   - Issue 7:  removed RUN_ONCE (dead config — never read by code)
+#   - Issue 14: removed LOG_FILE (CSV logging removed)
 
 import os
 
 # ── Hardcoded non-secrets ─────────────────────────────────────────────────────
 SYMBOLS             = ["BTC", "ETH"]
-POLL_INTERVAL       = 900           # 15 min (matches GHA schedule)
-INITIAL_CAPITAL     = 50.0          # USD
-RISK_PER_TRADE      = 0.02          # 2% of capital per trade
-STOP_LOSS_PCT       = 0.03          # 3%
-TAKE_PROFIT_PCT     = 0.05          # 5%
-PRICE_HISTORY_SIZE  = 50            # rolling candles kept in state.json
+INITIAL_CAPITAL     = 50.0
+RISK_PER_TRADE      = 0.02
+STOP_LOSS_PCT       = 0.03
+TAKE_PROFIT_PCT     = 0.05
+PRICE_HISTORY_SIZE  = 50
 EMA_FAST            = 9
 EMA_SLOW            = 21
 STATE_FILE          = "state.json"
-LOG_FILE            = "bot_log.csv"
 
 # ── Risk guardrails ───────────────────────────────────────────────────────────
-MAX_ORDER_AMOUNT_USD    = 10.0  # hard cap per trade regardless of capital
-CIRCUIT_BREAKER_LOSSES  = 3     # pause symbol after N consecutive losses
+MAX_ORDER_AMOUNT_USD    = 25.0
+CIRCUIT_BREAKER_LOSSES  = 3
+MIN_BUYING_POWER_BUFFER = 25.0
+
+# ── Signal quality filters (only affect signal exits, not SL/TP) ──────────────
+MIN_SIGNAL_GAP_PCT     = 0.0015   # 0.15% — EMA gap / price required for BUY
+MIN_SIGNAL_PROFIT_PCT  = 0.03     # 3%   — required for signal SELL (covers fees)
+MIN_HOLD_CANDLES       = 4        # 1hr min hold before signal exit
+
 
 # ── Lazy loaders ──────────────────────────────────────────────────────────────
 
@@ -43,66 +52,33 @@ def get_supabase_key() -> str:
     return val
 
 def get_discord_webhook_url() -> str | None:
-    return os.getenv("DISCORD_WEBHOOK_URL")  # optional — returns None if not set
+    return os.getenv("DISCORD_WEBHOOK_URL")
 
-def get_symbols() -> list[str]:
+def get_symbols() -> list:
     raw = os.getenv("SYMBOLS")
     return list(dict.fromkeys(s.strip() for s in raw.split(","))) if raw else SYMBOLS
 
 def is_dry_run() -> bool:
     return os.getenv("DRY_RUN", "0").strip() in ("1", "true", "yes")
 
-def get_max_order_usd() -> float:
-    raw = os.getenv("MAX_ORDER_AMOUNT_USD")
+def _float_env(key: str, default: float) -> float:
+    raw = os.getenv(key)
     try:
-        return float(raw) if raw else MAX_ORDER_AMOUNT_USD
+        return float(raw) if raw else default
     except ValueError:
-        return MAX_ORDER_AMOUNT_USD
+        return default
 
-def get_circuit_breaker_losses() -> int:
-    raw = os.getenv("CIRCUIT_BREAKER_LOSSES")
+def _int_env(key: str, default: int) -> int:
+    raw = os.getenv(key)
     try:
-        return int(raw) if raw else CIRCUIT_BREAKER_LOSSES
+        return int(raw) if raw else default
     except ValueError:
-        return CIRCUIT_BREAKER_LOSSES
+        return default
 
-def get_price_history_size() -> int:
-    raw = os.getenv("PRICE_HISTORY_SIZE")
-    try:
-        return int(raw) if raw else PRICE_HISTORY_SIZE
-    except ValueError:
-        return PRICE_HISTORY_SIZE
-
-# ── Buying power safety ───────────────────────────────────────────────────────
-# Minimum cash buying power that must remain AFTER the order.
-# Prevents the bot from spending every last dollar and triggering
-# a margin maintenance call when both bots are active simultaneously.
-MIN_BUYING_POWER_BUFFER = 25.0  # always keep at least $25 free
-
-def get_min_buying_power_buffer() -> float:
-    raw = os.getenv("MIN_BUYING_POWER_BUFFER")
-    try:
-        return float(raw) if raw else MIN_BUYING_POWER_BUFFER
-    except ValueError:
-        return MIN_BUYING_POWER_BUFFER
-
-# ── Signal quality filters ────────────────────────────────────────────────────
-# These only affect signal-based entries/exits, never SL/TP hard exits.
-MIN_SIGNAL_GAP_PCT     = 0.0015   # 0.15% — EMA gap / price must exceed this for BUY
-MIN_SIGNAL_PROFIT_PCT  = 0.003    # 0.3%  — signal SELL must be this profitable (covers ~$0.12 fees on $10 trade)
-MIN_HOLD_CANDLES       = 4        # block signal exits until position is 4 candles old (1hr at 15min)
-
-def get_min_signal_gap_pct() -> float:
-    raw = os.getenv("MIN_SIGNAL_GAP_PCT")
-    try: return float(raw) if raw else MIN_SIGNAL_GAP_PCT
-    except ValueError: return MIN_SIGNAL_GAP_PCT
-
-def get_min_signal_profit_pct() -> float:
-    raw = os.getenv("MIN_SIGNAL_PROFIT_PCT")
-    try: return float(raw) if raw else MIN_SIGNAL_PROFIT_PCT
-    except ValueError: return MIN_SIGNAL_PROFIT_PCT
-
-def get_min_hold_candles() -> int:
-    raw = os.getenv("MIN_HOLD_CANDLES")
-    try: return int(raw) if raw else MIN_HOLD_CANDLES
-    except ValueError: return MIN_HOLD_CANDLES
+def get_max_order_usd()           -> float: return _float_env("MAX_ORDER_AMOUNT_USD",    MAX_ORDER_AMOUNT_USD)
+def get_circuit_breaker_losses()  -> int:   return _int_env  ("CIRCUIT_BREAKER_LOSSES",  CIRCUIT_BREAKER_LOSSES)
+def get_price_history_size()      -> int:   return _int_env  ("PRICE_HISTORY_SIZE",      PRICE_HISTORY_SIZE)
+def get_min_buying_power_buffer() -> float: return _float_env("MIN_BUYING_POWER_BUFFER", MIN_BUYING_POWER_BUFFER)
+def get_min_signal_gap_pct()      -> float: return _float_env("MIN_SIGNAL_GAP_PCT",      MIN_SIGNAL_GAP_PCT)
+def get_min_signal_profit_pct()   -> float: return _float_env("MIN_SIGNAL_PROFIT_PCT",   MIN_SIGNAL_PROFIT_PCT)
+def get_min_hold_candles()        -> int:   return _int_env  ("MIN_HOLD_CANDLES",        MIN_HOLD_CANDLES)

@@ -1,15 +1,9 @@
 # crypto_bot/execution/trader.py
 #
-# After placing any order, polls get_order() to get the real fill price
-# (averagePrice) and filled quantity instead of using the quote price.
-#
-# Why this matters: market orders fill at exchange execution price which
-# can differ from the quote price at signal time. Using the real fill
-# price ensures P&L calculations are accurate.
-#
-# Polling strategy: try up to 5 times with 2s delay.
-# If the order isn't filled yet (NEW/PARTIALLY_FILLED) or 404s due to
-# eventual consistency, fall back to the quote price gracefully.
+# Fixes from audit:
+#   - Issue 4: P&L computed from actual fill_price × size, not stale usd_amount
+#   - Issue 6: candles_at_entry naming clarified (was entry_candle)
+#   - Issue 9: poll attempts increased 5→8, delay 2s→2.5s = 20s max wait
 
 import time
 from crypto_bot.exchange.public_api import (
@@ -24,24 +18,24 @@ from crypto_bot.logging import supabase_logger
 from crypto_bot.logging.logger import log, log_error, log_warn
 from crypto_bot.notifications import discord
 from crypto_bot.state.state import record_win, record_loss
-from crypto_bot.config.settings import STOP_LOSS_PCT, TAKE_PROFIT_PCT, is_dry_run, get_min_buying_power_buffer
+from crypto_bot.config.settings import (
+    STOP_LOSS_PCT, TAKE_PROFIT_PCT, is_dry_run, get_min_buying_power_buffer,
+)
 
-FILL_POLL_ATTEMPTS = 5
-FILL_POLL_DELAY    = 2  # seconds between polls
+FILL_POLL_ATTEMPTS = 8     # up from 5 — Public has eventual consistency on order endpoint
+FILL_POLL_DELAY    = 2.5   # 8 × 2.5s = 20s max wait
 
 
 def _poll_fill_price(account_id: str, order_id: str, fallback_price: float) -> tuple[float, float]:
     """
-    Poll get_order() until the order is FILLED or attempts are exhausted.
-
+    Poll get_order() until the order is FILLED or attempts exhausted.
     Returns (fill_price, filled_quantity).
-    Falls back to (fallback_price, 0.0) if fill can't be confirmed.
     """
     for attempt in range(1, FILL_POLL_ATTEMPTS + 1):
         try:
             order = get_order(account_id, order_id)
-            status = order.get("status", "")
-            avg_price = order.get("averagePrice")
+            status     = order.get("status", "")
+            avg_price  = order.get("averagePrice")
             filled_qty = order.get("filledQuantity")
 
             if status == "FILLED" and avg_price:
@@ -51,7 +45,6 @@ def _poll_fill_price(account_id: str, order_id: str, fallback_price: float) -> t
                 log_warn(f"[trader] Order {order_id} ended with status {status}")
                 return fallback_price, 0.0
 
-            # Still pending — wait and retry
             if attempt < FILL_POLL_ATTEMPTS:
                 time.sleep(FILL_POLL_DELAY)
 
@@ -75,22 +68,22 @@ class Trader:
 
     @property
     def positions(self) -> dict:
-        return self.state["positions"]
+        return self.state.setdefault("positions", {})
 
     def _get_account_id(self) -> str:
         if self._account_id is None:
             self._account_id = get_primary_account_id()
         return self._account_id
 
+    # ── BUY ────────────────────────────────────────────────────────────────────
     def buy(self, symbol: str, price: float, usd_amount: float) -> None:
-        fill_price = price  # default to quote price
+        fill_price = price
+        actual_qty: float | None = None
 
         if self._dry_run:
             log(f"[DRY RUN] Would BUY {symbol} ${usd_amount:.2f}", self.run_id)
         else:
-            # Check buying power before placing order.
-            # Ensures we never spend below the minimum buffer, preventing
-            # margin maintenance calls when both bots are running.
+            # Buying power check
             try:
                 cash_bp = get_cash_buying_power(self._get_account_id())
                 buffer  = get_min_buying_power_buffer()
@@ -101,7 +94,11 @@ class Trader:
                         self.run_id,
                     )
                     return
-                log(f"[trader] Buying power check passed — ${cash_bp:.2f} available, need ${usd_amount:.2f} + ${buffer:.2f} buffer", self.run_id)
+                log(
+                    f"[trader] Buying power check passed — ${cash_bp:.2f} available, "
+                    f"need ${usd_amount:.2f} + ${buffer:.2f} buffer",
+                    self.run_id,
+                )
             except Exception as e:
                 log_warn(f"[trader] Buying power check failed: {e} — proceeding with order", self.run_id)
 
@@ -109,41 +106,55 @@ class Trader:
                 result   = place_order_buy(self._get_account_id(), symbol, usd_amount)
                 order_id = result.get("orderId") or result.get("_clientOrderId")
 
-                # Poll for real fill price
                 if order_id:
-                    raw_fill, _ = _poll_fill_price(self._get_account_id(), order_id, price)
+                    raw_fill, raw_qty = _poll_fill_price(self._get_account_id(), order_id, price)
                     if raw_fill > 0:
                         fill_price = raw_fill
                         if fill_price != price:
-                            log(f"[trader] BUY {symbol} fill price {fill_price:.2f} (quote was {price:.2f})", self.run_id)
+                            log(
+                                f"[trader] BUY {symbol} fill price {fill_price:.2f} (quote was {price:.2f})",
+                                self.run_id,
+                            )
                     else:
-                        log_warn(f"[trader] BUY {symbol} fill price from API was invalid ({raw_fill:.2f}) — using quote price {price:.2f}", self.run_id)
+                        log_warn(
+                            f"[trader] BUY {symbol} fill price from API was invalid ({raw_fill:.2f}) "
+                            f"— using quote price {price:.2f}",
+                            self.run_id,
+                        )
                         fill_price = price
+                    if raw_qty > 0:
+                        actual_qty = raw_qty
 
             except Exception as e:
                 log_error(f"[trader] BUY {symbol} failed: {e}", self.run_id)
                 discord.notify_error(f"BUY {symbol}", str(e))
                 return
 
-        # Use real fill price for SL/TP and position tracking
-        sl            = round(fill_price * (1 - STOP_LOSS_PCT), 6)
-        tp            = round(fill_price * (1 + TAKE_PROFIT_PCT), 6)
-        size_estimate = usd_amount / fill_price
+        # Use actual filled quantity if available (issue 4 — was using stale usd_amount/entry)
+        size_estimate = actual_qty if actual_qty else (usd_amount / fill_price)
+
+        sl = round(fill_price * (1 - STOP_LOSS_PCT), 6)
+        tp = round(fill_price * (1 + TAKE_PROFIT_PCT), 6)
+
+        # candles_at_entry (renamed from entry_candle for clarity, audit issue 6)
+        # By this point append_price has run, so price_history includes the entry candle.
+        candles_at_entry = len(self.state.get("price_history", {}).get(symbol, []))
 
         self.positions[symbol] = {
-            "entry":         fill_price,
-            "usd_amount":    usd_amount,
-            "size_estimate": size_estimate,
-            "stop_loss":     sl,
-            "take_profit":   tp,
-            # Track candle count at entry for minimum hold time check
-            "entry_candle":  len(self.state["price_history"].get(symbol, [])),
+            "entry":            fill_price,
+            "usd_amount":       usd_amount,
+            "size_estimate":    size_estimate,
+            "stop_loss":        sl,
+            "take_profit":      tp,
+            "candles_at_entry": candles_at_entry,
+            # Keep legacy key for backward-compat with old state files
+            "entry_candle":     candles_at_entry,
         }
 
         mode = "DRY RUN " if self._dry_run else ""
         log(
             f"{mode}BUY  {symbol} | fill={fill_price:.2f} | amount=${usd_amount:.2f} | "
-            f"SL={sl:.2f} TP={tp:.2f}",
+            f"qty={size_estimate:.8f} | SL={sl:.2f} TP={tp:.2f}",
             self.run_id,
         )
 
@@ -153,33 +164,34 @@ class Trader:
         if not self._dry_run:
             discord.notify_buy(symbol, fill_price, usd_amount, sl, tp)
 
+    # ── SELL ───────────────────────────────────────────────────────────────────
     def sell(self, symbol: str, price: float, reason: str = "signal") -> None:
         if symbol not in self.positions:
             log_error(f"[trader] sell called for {symbol} but no open position", self.run_id)
             return
 
         pos           = self.positions[symbol]
+        entry_price   = pos["entry"]
         usd_amount    = pos["usd_amount"]
         size_estimate = pos.get("size_estimate", 0)
 
-        # Guard against zero/missing size — recalculate from entry if needed
         if not size_estimate or size_estimate <= 0:
-            size_estimate = usd_amount / pos["entry"]
-            log_warn(f"[trader] {symbol} size_estimate was 0 — recalculated as {size_estimate:.8f} from entry", self.run_id)
+            size_estimate = usd_amount / entry_price
+            log_warn(
+                f"[trader] {symbol} size_estimate was 0 — recalculated as {size_estimate:.8f} from entry",
+                self.run_id,
+            )
 
-        fill_price    = price  # default to quote price
+        fill_price = price
 
         if self._dry_run:
             log(f"[DRY RUN] Would SELL {symbol} qty={size_estimate:.8f}", self.run_id)
         else:
-            # Fetch actual position quantity from Public before selling.
-            # Our size_estimate may differ from actual fill due to fees/rounding
-            # or bad fill price data — using the real quantity prevents
-            # "would result in short position" rejections.
+            # Get real position quantity from Public to avoid short-position errors
             try:
                 real_qty = get_crypto_position_quantity(self._get_account_id(), symbol)
                 if real_qty is not None and real_qty > 0:
-                    if abs(real_qty - size_estimate) / size_estimate > 0.01:
+                    if size_estimate > 0 and abs(real_qty - size_estimate) / size_estimate > 0.01:
                         log_warn(
                             f"[trader] {symbol} size_estimate {size_estimate:.8f} differs from "
                             f"actual position {real_qty:.8f} — using real quantity",
@@ -187,7 +199,10 @@ class Trader:
                         )
                     size_estimate = real_qty
                 else:
-                    log_warn(f"[trader] Could not fetch real {symbol} quantity — using estimate {size_estimate:.8f}", self.run_id)
+                    log_warn(
+                        f"[trader] Could not fetch real {symbol} quantity — using estimate {size_estimate:.8f}",
+                        self.run_id,
+                    )
             except Exception as e:
                 log_warn(f"[trader] Portfolio quantity check failed: {e} — using estimate", self.run_id)
 
@@ -195,17 +210,22 @@ class Trader:
                 result   = place_order_sell(self._get_account_id(), symbol, size_estimate)
                 order_id = result.get("orderId") or result.get("_clientOrderId")
 
-                # Poll for real fill price
                 if order_id:
                     raw_fill, filled_qty = _poll_fill_price(self._get_account_id(), order_id, price)
                     if raw_fill > 0:
                         fill_price = raw_fill
                         if fill_price != price:
-                            log(f"[trader] SELL {symbol} fill price {fill_price:.2f} (quote was {price:.2f})", self.run_id)
+                            log(
+                                f"[trader] SELL {symbol} fill price {fill_price:.2f} (quote was {price:.2f})",
+                                self.run_id,
+                            )
                     else:
-                        log_warn(f"[trader] SELL {symbol} fill price from API was invalid ({raw_fill:.2f}) — using quote price {price:.2f}", self.run_id)
+                        log_warn(
+                            f"[trader] SELL {symbol} fill price from API was invalid ({raw_fill:.2f}) "
+                            f"— using quote price {price:.2f}",
+                            self.run_id,
+                        )
                         fill_price = price
-                    # Use actual filled quantity if available for more accurate P&L
                     if filled_qty > 0:
                         size_estimate = filled_qty
 
@@ -214,13 +234,17 @@ class Trader:
                 discord.notify_error(f"SELL {symbol}", str(e))
                 return
 
-        # P&L calculated using real fill prices on both sides
-        pnl = (fill_price / pos["entry"] - 1) * usd_amount
+        # ── P&L from actual quantities (issue 4 fix) ──
+        # Old: pnl = (fill / entry - 1) * usd_amount  ← used stale notional
+        # New: proceeds - cost using ACTUAL size_estimate (potentially partial fill)
+        proceeds = fill_price  * size_estimate
+        cost     = entry_price * size_estimate
+        pnl      = proceeds - cost
 
         mode = "DRY RUN " if self._dry_run else ""
         log(
             f"{mode}SELL {symbol} | fill={fill_price:.2f} | qty={size_estimate:.8f} | "
-            f"pnl={pnl:+.4f} | reason={reason}",
+            f"proceeds=${proceeds:.4f} cost=${cost:.4f} pnl={pnl:+.4f} | reason={reason}",
             self.run_id,
         )
 
@@ -235,15 +259,15 @@ class Trader:
         if not self._dry_run:
             discord.notify_sell(symbol, fill_price, pnl, reason)
 
-        self.state["capital"] += pnl
+        self.state["capital"] = self.state.get("capital", 0.0) + pnl
         del self.positions[symbol]
 
     def check_exit(self, symbol: str, price: float) -> str | None:
         pos = self.positions.get(symbol)
         if not pos:
             return None
-        if price <= pos["stop_loss"]:
+        if price <= pos.get("stop_loss", float("-inf")):
             return "STOP_LOSS"
-        if price >= pos["take_profit"]:
+        if price >= pos.get("take_profit", float("inf")):
             return "TAKE_PROFIT"
         return None
