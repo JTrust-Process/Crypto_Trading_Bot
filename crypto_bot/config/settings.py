@@ -32,6 +32,12 @@ ATR_SL_MULTIPLIER      = 2.0   # SL = entry - (2 × ATR)
 ATR_TP_MULTIPLIER      = 4.0   # TP = entry + (4 × ATR)  → 2:1 reward:risk
 COOLDOWN_CANDLES       = 4     # candles to wait after exit before re-entering same symbol
 
+# ── Fee accounting ────────────────────────────────────────────────────────────
+# Public charges $0.06 per crypto order. Round trip = $0.12.
+# We subtract this from realised P&L on every SELL so dashboard numbers
+# reflect what actually hits the account, not gross before fees.
+CRYPTO_FEE_PER_ORDER   = 0.06
+
 
 # ── Lazy loaders ──────────────────────────────────────────────────────────────
 
@@ -88,3 +94,4 @@ def get_atr_period()              -> int:   return _int_env  ("ATR_PERIOD",     
 def get_atr_sl_multiplier()       -> float: return _float_env("ATR_SL_MULTIPLIER",       ATR_SL_MULTIPLIER)
 def get_atr_tp_multiplier()       -> float: return _float_env("ATR_TP_MULTIPLIER",       ATR_TP_MULTIPLIER)
 def get_cooldown_candles()        -> int:   return _int_env  ("COOLDOWN_CANDLES",        COOLDOWN_CANDLES)
+def get_crypto_fee_per_order()    -> float: return _float_env("CRYPTO_FEE_PER_ORDER",    CRYPTO_FEE_PER_ORDER)

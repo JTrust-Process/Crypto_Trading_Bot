@@ -15,7 +15,7 @@ from crypto_bot.notifications import discord
 from crypto_bot.state.state import record_win, record_loss, record_exit
 from crypto_bot.config.settings import (
     STOP_LOSS_PCT, TAKE_PROFIT_PCT, is_dry_run, get_min_buying_power_buffer,
-    get_atr_sl_multiplier, get_atr_tp_multiplier,
+    get_atr_sl_multiplier, get_atr_tp_multiplier, get_crypto_fee_per_order,
 )
 from crypto_bot.data.coingecko import compute_atr
 
@@ -106,6 +106,7 @@ class Trader:
     def buy(self, symbol: str, price: float, usd_amount: float) -> None:
         fill_price = price
         actual_qty: float | None = None
+        order_id:   str | None   = None  # captured from API response, saved to Supabase
 
         if self._dry_run:
             log(f"[DRY RUN] Would BUY {symbol} ${usd_amount:.2f}", self.run_id)
@@ -182,7 +183,7 @@ class Trader:
         )
 
         reason = "DRY_RUN/entry" if self._dry_run else "entry"
-        supabase_logger.log_trade(symbol, "BUY", fill_price, size_estimate, 0.0, reason, self.run_id)
+        supabase_logger.log_trade(symbol, "BUY", fill_price, size_estimate, 0.0, reason, self.run_id, order_id=order_id)
 
         if not self._dry_run:
             discord.notify_buy(symbol, fill_price, usd_amount, sl, tp)
@@ -206,6 +207,7 @@ class Trader:
             )
 
         fill_price = price
+        order_id: str | None = None  # captured from API response, saved to Supabase
 
         if self._dry_run:
             log(f"[DRY RUN] Would SELL {symbol} qty={size_estimate:.8f}", self.run_id)
@@ -256,20 +258,29 @@ class Trader:
                 discord.notify_error(f"SELL {symbol}", str(e))
                 return
 
-        # P&L from actual quantities
-        proceeds = fill_price  * size_estimate
-        cost     = entry_price * size_estimate
-        pnl      = proceeds - cost
+        # P&L from actual quantities, then subtract round-trip fees.
+        # Public charges per-order (BUY + SELL = 2 × fee). DRY_RUN trades
+        # incur no real fees so we leave gross P&L alone in that mode.
+        gross_proceeds = fill_price  * size_estimate
+        gross_cost     = entry_price * size_estimate
+        gross_pnl      = gross_proceeds - gross_cost
+
+        if self._dry_run:
+            fees = 0.0
+            pnl  = gross_pnl
+        else:
+            fees = get_crypto_fee_per_order() * 2  # round trip
+            pnl  = gross_pnl - fees
 
         mode = "DRY RUN " if self._dry_run else ""
         log(
             f"{mode}SELL {symbol} | fill={fill_price:.2f} | qty={size_estimate:.8f} | "
-            f"proceeds=${proceeds:.4f} cost=${cost:.4f} pnl={pnl:+.4f} | reason={reason}",
+            f"gross={gross_pnl:+.4f} fees=${fees:.2f} net={pnl:+.4f} | reason={reason}",
             self.run_id,
         )
 
         full_reason = f"DRY_RUN/{reason}" if self._dry_run else reason
-        supabase_logger.log_trade(symbol, "SELL", fill_price, size_estimate, pnl, full_reason, self.run_id)
+        supabase_logger.log_trade(symbol, "SELL", fill_price, size_estimate, pnl, full_reason, self.run_id, order_id=order_id)
 
         if pnl >= 0:
             record_win(self.state, symbol)
