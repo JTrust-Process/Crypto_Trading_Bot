@@ -1,20 +1,4 @@
 # crypto_bot/state/state.py
-#
-# Schema:
-# {
-#   "capital": 50.0,
-#   "positions": {
-#     "BTC": {
-#       "entry": 67000.0, "usd_amount": 10.0, "size_estimate": 0.000149,
-#       "stop_loss": 64990.0, "take_profit": 70350.0,
-#       "entry_candle": 22
-#     }
-#   },
-#   "price_history":      { "BTC": [...], "ETH": [...] },
-#   "consecutive_losses": { "BTC": 0, "ETH": 2 },
-#   "circuit_notified":   { "BTC": "2025-04-22" },  # last date we pinged Discord
-#   "last_daily_summary": "2025-04-22"
-# }
 
 import json
 import os
@@ -30,6 +14,8 @@ def _default_state() -> dict:
         "consecutive_losses": {},
         "circuit_notified":   {},
         "last_daily_summary": "",
+        # Cooldown: candle index at which a position last closed per symbol
+        "last_exit_candle":   {},
     }
 
 
@@ -39,13 +25,13 @@ def load_state() -> dict:
     try:
         with open(STATE_FILE, "r") as f:
             data = json.load(f)
-        # Ensure all keys exist — protects against stale state files
         data.setdefault("capital",            INITIAL_CAPITAL)
         data.setdefault("positions",          {})
         data.setdefault("price_history",      {})
         data.setdefault("consecutive_losses", {})
         data.setdefault("circuit_notified",   {})
         data.setdefault("last_daily_summary", "")
+        data.setdefault("last_exit_candle",   {})
         return data
     except (json.JSONDecodeError, OSError):
         return _default_state()
@@ -70,16 +56,13 @@ def get_price_history(state: dict, symbol: str) -> list:
 
 
 def record_loss(state: dict, symbol: str) -> int:
-    """Increment consecutive loss counter. Returns new count."""
     losses = state.setdefault("consecutive_losses", {})
     losses[symbol] = losses.get(symbol, 0) + 1
     return losses[symbol]
 
 
 def record_win(state: dict, symbol: str) -> None:
-    """Reset consecutive loss counter on a winning trade."""
     state.setdefault("consecutive_losses", {})[symbol] = 0
-    # Also clear circuit notification so next time it trips it'll ping again
     state.setdefault("circuit_notified", {}).pop(symbol, None)
 
 
@@ -88,22 +71,37 @@ def get_consecutive_losses(state: dict, symbol: str) -> int:
 
 
 def is_circuit_broken(state: dict, symbol: str, threshold: int) -> bool:
-    """Returns True if symbol should be paused due to too many consecutive losses."""
     return get_consecutive_losses(state, symbol) >= threshold
 
 
-# ── Circuit breaker notification tracking (issue 12) ──────────────────────────
-
 def should_notify_circuit_broken(state: dict, symbol: str) -> bool:
-    """
-    Returns True if we should send a Discord ping for circuit breaker on this symbol.
-    Only fires once per UTC day per symbol — prevents spam every 15 min.
-    """
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    last_notified = state.setdefault("circuit_notified", {}).get(symbol, "")
-    return last_notified != today
+    return state.setdefault("circuit_notified", {}).get(symbol, "") != today
 
 
 def mark_circuit_notified(state: dict, symbol: str) -> None:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     state.setdefault("circuit_notified", {})[symbol] = today
+
+
+# ── Cooldown tracking (NEW) ───────────────────────────────────────────────────
+
+def record_exit(state: dict, symbol: str) -> None:
+    """
+    Record the candle index at which a position was closed.
+    Used to enforce a cooldown before re-entering the same symbol.
+    """
+    current_candle = len(state.get("price_history", {}).get(symbol, []))
+    state.setdefault("last_exit_candle", {})[symbol] = current_candle
+
+
+def candles_since_exit(state: dict, symbol: str) -> int | None:
+    """
+    Returns number of candles elapsed since last exit on this symbol.
+    Returns None if no prior exit recorded (no cooldown applies).
+    """
+    last_exit = state.get("last_exit_candle", {}).get(symbol)
+    if last_exit is None:
+        return None
+    current = len(state.get("price_history", {}).get(symbol, []))
+    return current - last_exit

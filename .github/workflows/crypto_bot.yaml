@@ -1,5 +1,7 @@
 # .github/workflows/crypto_bot.yml
 # LIVE MODE — DRY_RUN=0
+#
+# Strategy v2 — adds regime filter, ATR-based SL/TP, post-exit cooldown.
 
 name: Crypto Bot
 
@@ -17,14 +19,19 @@ jobs:
       SYMBOLS: "BTC,ETH"
       INITIAL_CAPITAL: "50"
       RISK_PER_TRADE: "0.02"
-      STOP_LOSS_PCT: "0.03"
-      TAKE_PROFIT_PCT: "0.05"
+      STOP_LOSS_PCT: "0.03"        # fallback only — used if ATR fetch fails
+      TAKE_PROFIT_PCT: "0.05"      # fallback only — used if ATR fetch fails
       MAX_ORDER_AMOUNT_USD: "25"
       MIN_BUYING_POWER_BUFFER: "25"
       CIRCUIT_BREAKER_LOSSES: "3"
       MIN_SIGNAL_GAP_PCT: "0.0015"
       MIN_SIGNAL_PROFIT_PCT: "0.03"
       MIN_HOLD_CANDLES: "4"
+      # ── Strategy v2 ──
+      ATR_PERIOD: "14"
+      ATR_SL_MULTIPLIER: "2.0"     # SL = entry - 2×ATR
+      ATR_TP_MULTIPLIER: "4.0"     # TP = entry + 4×ATR  (2:1 reward:risk)
+      COOLDOWN_CANDLES: "4"        # 1hr block after exit before re-entering
       DRY_RUN: "0"
       PUBLIC_SECRET: ${{ secrets.PUBLIC_SECRET }}
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}

@@ -1,23 +1,25 @@
 # crypto_bot/strategy/signal.py
 #
-# EMA 9/21 crossover with gap quality filter.
+# EMA 9/21 crossover + 50-EMA regime filter + ATR-based volatility scaling.
 #
-# Fixes from audit:
-#   - Issue 5: SMA-seeded EMAs for faster convergence + 2-candle warmup buffer
-#     prevents false crossovers from EMA initialization noise
-#   - Issue 16: strict inequality on prev to avoid double-firing on equality
+# Strategy improvements (audit part 2):
+#   - Regime filter: only allow BUY when price > EMA50 AND EMA50 trending up
+#   - This filters out crossovers that happen during ranging/bearish periods
+#     where we'd just get chopped up
+#
+# The regime filter is APPLIED IN engine.py (not here) so HOLD signals
+# during chop are still logged with helpful context.
 
 from crypto_bot.config.settings import EMA_FAST, EMA_SLOW
 
+REGIME_EMA_PERIOD = 50  # higher-timeframe-ish trend filter
+REGIME_LOOKBACK   = 5   # how many candles back to check if EMA50 is rising
+
 
 def ema(values: list, period: int) -> list:
-    """
-    EMA with SMA seeding — first EMA value is the SMA of the first `period`
-    points, not just `values[0]`. Converges much faster and reduces the
-    initialization-noise problem described in audit issue 5.
-    """
+    """EMA with SMA seeding — converges faster than seeding from values[0]."""
     if len(values) < period:
-        # Not enough data yet — fall back to running average
+        # Not enough data — running average
         result = []
         running = 0.0
         for i, v in enumerate(values):
@@ -27,9 +29,6 @@ def ema(values: list, period: int) -> list:
 
     k = 2 / (period + 1)
     seed = sum(values[:period]) / period
-    result = [seed]
-    # The first `period` values get the SMA seed; index = period-1 is the seed
-    # Pad earlier indices with the seed so output length matches input length
     result = [seed] * period
     for price in values[period:]:
         result.append(price * k + result[-1] * (1 - k))
@@ -39,11 +38,7 @@ def ema(values: list, period: int) -> list:
 def generate_signal(prices: list, in_position: bool) -> tuple[str, float]:
     """
     Returns (signal, gap_pct).
-      signal:  "BUY" | "SELL" | "HOLD"
-      gap_pct: |EMA9 - EMA21| / price — used to filter weak signals.
-
-    Requires at least EMA_SLOW + 2 prices (one extra beyond warmup) so that
-    the first detected crossover isn't an artifact of EMA initialization.
+    Pure crossover detection — regime filtering happens in engine.py.
     """
     if len(prices) < EMA_SLOW + 2:
         return "HOLD", 0.0
@@ -54,8 +49,6 @@ def generate_signal(prices: list, in_position: bool) -> tuple[str, float]:
     fast_now,  slow_now  = ema_fast[-1],  ema_slow[-1]
     fast_prev, slow_prev = ema_fast[-2],  ema_slow[-2]
 
-    # Strict inequality on prev — prevents double-firing on the rare
-    # case where prev EMAs are exactly equal (audit issue 16)
     crossed_up   = fast_prev <  slow_prev and fast_now > slow_now
     crossed_down = fast_prev >  slow_prev and fast_now < slow_now
 
@@ -68,6 +61,46 @@ def generate_signal(prices: list, in_position: bool) -> tuple[str, float]:
         return "SELL", gap_pct
 
     return "HOLD", gap_pct
+
+
+# ── Regime detection (NEW) ────────────────────────────────────────────────────
+
+def regime_check(prices: list) -> tuple[bool, str]:
+    """
+    Returns (is_uptrend, reason).
+
+    is_uptrend = True  → market is trending up; BUY signals allowed
+    is_uptrend = False → market is ranging/bearish; HOLD all BUY signals
+
+    Conditions for uptrend:
+      1. Current price > EMA50  (price is above the trend line)
+      2. EMA50 is RISING  (compare current vs N candles ago)
+
+    If we don't have enough data yet (< 50 prices), default to allowing trades
+    (don't lock the bot out forever during warmup).
+    """
+    if len(prices) < REGIME_EMA_PERIOD + REGIME_LOOKBACK:
+        return True, f"insufficient data for regime filter ({len(prices)}/{REGIME_EMA_PERIOD + REGIME_LOOKBACK})"
+
+    ema50      = ema(prices, REGIME_EMA_PERIOD)
+    current    = prices[-1]
+    ema_now    = ema50[-1]
+    ema_before = ema50[-1 - REGIME_LOOKBACK]
+
+    price_above_ema = current > ema_now
+    ema_rising      = ema_now > ema_before
+
+    if price_above_ema and ema_rising:
+        slope_pct = ((ema_now / ema_before) - 1) * 100
+        return True, f"uptrend (price ${current:.2f} > EMA50 ${ema_now:.2f}, slope +{slope_pct:.3f}% over {REGIME_LOOKBACK} candles)"
+
+    reasons = []
+    if not price_above_ema:
+        reasons.append(f"price ${current:.2f} below EMA50 ${ema_now:.2f}")
+    if not ema_rising:
+        slope_pct = ((ema_now / ema_before) - 1) * 100
+        reasons.append(f"EMA50 flat/falling ({slope_pct:+.3f}% over {REGIME_LOOKBACK} candles)")
+    return False, "; ".join(reasons)
 
 
 def warmup_progress(prices: list) -> str:

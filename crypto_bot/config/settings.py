@@ -2,10 +2,6 @@
 #
 # NO os.getenv() calls at module level.
 # All values read lazily after load_dotenv() runs in __main__.
-#
-# Fixes from audit:
-#   - Issue 7:  removed RUN_ONCE (dead config — never read by code)
-#   - Issue 14: removed LOG_FILE (CSV logging removed)
 
 import os
 
@@ -13,9 +9,9 @@ import os
 SYMBOLS             = ["BTC", "ETH"]
 INITIAL_CAPITAL     = 50.0
 RISK_PER_TRADE      = 0.02
-STOP_LOSS_PCT       = 0.03
-TAKE_PROFIT_PCT     = 0.05
-PRICE_HISTORY_SIZE  = 50
+STOP_LOSS_PCT       = 0.03   # only used as fallback when ATR unavailable
+TAKE_PROFIT_PCT     = 0.05   # only used as fallback when ATR unavailable
+PRICE_HISTORY_SIZE  = 80     # bumped from 50 — need 50 for regime filter + buffer
 EMA_FAST            = 9
 EMA_SLOW            = 21
 STATE_FILE          = "state.json"
@@ -25,10 +21,16 @@ MAX_ORDER_AMOUNT_USD    = 25.0
 CIRCUIT_BREAKER_LOSSES  = 3
 MIN_BUYING_POWER_BUFFER = 25.0
 
-# ── Signal quality filters (only affect signal exits, not SL/TP) ──────────────
-MIN_SIGNAL_GAP_PCT     = 0.0015   # 0.15% — EMA gap / price required for BUY
-MIN_SIGNAL_PROFIT_PCT  = 0.03     # 3%   — required for signal SELL (covers fees)
-MIN_HOLD_CANDLES       = 4        # 1hr min hold before signal exit
+# ── Signal quality filters ────────────────────────────────────────────────────
+MIN_SIGNAL_GAP_PCT     = 0.0015
+MIN_SIGNAL_PROFIT_PCT  = 0.03
+MIN_HOLD_CANDLES       = 4
+
+# ── Strategy 2 additions ──────────────────────────────────────────────────────
+ATR_PERIOD             = 14    # ATR averaging window
+ATR_SL_MULTIPLIER      = 2.0   # SL = entry - (2 × ATR)
+ATR_TP_MULTIPLIER      = 4.0   # TP = entry + (4 × ATR)  → 2:1 reward:risk
+COOLDOWN_CANDLES       = 4     # candles to wait after exit before re-entering same symbol
 
 
 # ── Lazy loaders ──────────────────────────────────────────────────────────────
@@ -82,3 +84,7 @@ def get_min_buying_power_buffer() -> float: return _float_env("MIN_BUYING_POWER_
 def get_min_signal_gap_pct()      -> float: return _float_env("MIN_SIGNAL_GAP_PCT",      MIN_SIGNAL_GAP_PCT)
 def get_min_signal_profit_pct()   -> float: return _float_env("MIN_SIGNAL_PROFIT_PCT",   MIN_SIGNAL_PROFIT_PCT)
 def get_min_hold_candles()        -> int:   return _int_env  ("MIN_HOLD_CANDLES",        MIN_HOLD_CANDLES)
+def get_atr_period()              -> int:   return _int_env  ("ATR_PERIOD",              ATR_PERIOD)
+def get_atr_sl_multiplier()       -> float: return _float_env("ATR_SL_MULTIPLIER",       ATR_SL_MULTIPLIER)
+def get_atr_tp_multiplier()       -> float: return _float_env("ATR_TP_MULTIPLIER",       ATR_TP_MULTIPLIER)
+def get_cooldown_candles()        -> int:   return _int_env  ("COOLDOWN_CANDLES",        COOLDOWN_CANDLES)

@@ -1,10 +1,4 @@
 # crypto_bot/core/engine.py
-#
-# Fixes from audit:
-#   - Issue 2: RiskManager now takes state (live capital reads)
-#   - Issue 10: get_price retries when symbol has open position (so SL/TP don't get skipped)
-#   - Issue 11: daily summary fires BEFORE trade processing (avoid spam ordering)
-#   - Issue 12: circuit breaker pings only once per day per symbol
 
 import time
 from crypto_bot.config.settings import (
@@ -13,9 +7,10 @@ from crypto_bot.config.settings import (
     get_min_signal_gap_pct,
     get_min_signal_profit_pct,
     get_min_hold_candles,
+    get_cooldown_candles,
 )
 from crypto_bot.data.market_data import get_price
-from crypto_bot.strategy.signal import generate_signal, warmup_progress
+from crypto_bot.strategy.signal import generate_signal, regime_check, warmup_progress
 from crypto_bot.execution.trader import Trader
 from crypto_bot.risk.manager import RiskManager
 from crypto_bot.state.state import (
@@ -23,6 +18,7 @@ from crypto_bot.state.state import (
     append_price, get_price_history,
     is_circuit_broken, get_consecutive_losses,
     should_notify_circuit_broken, mark_circuit_notified,
+    candles_since_exit,
 )
 from crypto_bot.logging.logger import log, log_warn, log_error
 from crypto_bot.logging.monitor import Monitor
@@ -30,11 +26,6 @@ from crypto_bot.notifications import discord
 
 
 def _get_price_with_retry(symbol: str, attempts: int = 3, delay: float = 2.0) -> float | None:
-    """
-    Fetch price with retries — important for symbols with open positions
-    so we don't miss an SL/TP exit due to a transient API hiccup (issue 10).
-    Returns None if all attempts fail.
-    """
     for i in range(attempts):
         try:
             return get_price(symbol)
@@ -54,6 +45,7 @@ def run(monitor: Monitor, run_id: str | None) -> None:
     min_gap_pct    = get_min_signal_gap_pct()
     min_profit_pct = get_min_signal_profit_pct()
     min_hold       = get_min_hold_candles()
+    cooldown       = get_cooldown_candles()
 
     log(f"Run started — symbols={symbols} dry_run={dry_run}", run_id)
 
@@ -65,9 +57,8 @@ def run(monitor: Monitor, run_id: str | None) -> None:
     )
 
     trader = Trader(state, run_id)
-    risk   = RiskManager(state)  # issue 2 — now reads live capital from state
+    risk   = RiskManager(state)
 
-    # ── Daily summary FIRST so it doesn't pile on top of trade pings (issue 11) ──
     if not dry_run and discord.should_send_daily_summary(state):
         discord.notify_daily_summary(
             state=state,
@@ -82,7 +73,6 @@ def run(monitor: Monitor, run_id: str | None) -> None:
         try:
             in_position = symbol in trader.positions
 
-            # Circuit breaker check
             if is_circuit_broken(state, symbol, cb_thresh):
                 consecutive = get_consecutive_losses(state, symbol)
                 log_warn(
@@ -93,13 +83,11 @@ def run(monitor: Monitor, run_id: str | None) -> None:
                     run_id, "circuit_breaker",
                     f"{symbol} paused after {consecutive} losses",
                 )
-                # Issue 12: only ping Discord once per day per symbol
                 if not dry_run and should_notify_circuit_broken(state, symbol):
                     discord.notify_circuit_breaker(symbol, consecutive)
                     mark_circuit_notified(state, symbol)
                 continue
 
-            # Issue 10: retry price fetch if we have an open position (SL/TP would be skipped otherwise)
             price = _get_price_with_retry(symbol, attempts=3 if in_position else 1)
             if price is None:
                 if in_position:
@@ -133,7 +121,7 @@ def run(monitor: Monitor, run_id: str | None) -> None:
                 f"{symbol} signal={signal} price={price:.2f} gap_pct={gap_pct:.4f}",
             )
 
-            # 1. Hard exits (SL/TP) — ALWAYS fire regardless of guardrails
+            # 1. Hard exits — ALWAYS fire
             exit_reason = trader.check_exit(symbol, price)
             if exit_reason:
                 log(f"{symbol} | exit triggered: {exit_reason}", run_id)
@@ -141,8 +129,37 @@ def run(monitor: Monitor, run_id: str | None) -> None:
                 trader.sell(symbol, price, exit_reason)
                 continue
 
-            # 2. Strategy BUY — gated by min gap
+            # 2. Strategy BUY — gated by regime + cooldown + gap quality
             if signal == "BUY" and not in_position:
+
+                # 2a. Cooldown check — block re-entry for N candles after exit
+                since_exit = candles_since_exit(state, symbol)
+                if since_exit is not None and since_exit < cooldown:
+                    log(
+                        f"{symbol} | BUY signal suppressed — cooldown "
+                        f"({since_exit}/{cooldown} candles since last exit)",
+                        run_id,
+                    )
+                    monitor.log_event(
+                        run_id, "filtered",
+                        f"{symbol} cooldown active since_exit={since_exit}",
+                    )
+                    continue
+
+                # 2b. Regime check — only trade in confirmed uptrends
+                is_uptrend, reason = regime_check(prices)
+                if not is_uptrend:
+                    log(
+                        f"{symbol} | BUY signal suppressed — bad regime: {reason}",
+                        run_id,
+                    )
+                    monitor.log_event(
+                        run_id, "filtered",
+                        f"{symbol} regime block: {reason}",
+                    )
+                    continue
+
+                # 2c. Gap quality — filter weak crossovers
                 if gap_pct < min_gap_pct:
                     log(
                         f"{symbol} | BUY signal suppressed — gap {gap_pct*100:.3f}% < "
@@ -152,15 +169,16 @@ def run(monitor: Monitor, run_id: str | None) -> None:
                     monitor.log_event(run_id, "filtered", f"{symbol} weak BUY gap={gap_pct:.4f}")
                     continue
 
+                # All filters passed — execute
+                log(f"{symbol} | BUY filters passed — regime: {reason}", run_id)
                 usd_amount = risk.position_size_usd(price)
                 monitor.log_event(run_id, "buy", f"{symbol} ${usd_amount:.2f} at {price:.2f}")
                 trader.buy(symbol, price, usd_amount)
 
-            # 3. Strategy SELL — gated by min hold + min profit
+            # 3. Strategy SELL
             elif signal == "SELL" and in_position:
                 pos              = trader.positions[symbol]
                 entry_price      = pos["entry"]
-                # Read both new and legacy keys for backward compat (issue 6)
                 candles_at_entry = pos.get("candles_at_entry", pos.get("entry_candle", 0))
                 candles_held     = len(prices) - candles_at_entry
                 profit_pct       = (price / entry_price) - 1 if entry_price else 0.0

@@ -1,9 +1,4 @@
 # crypto_bot/execution/trader.py
-#
-# Fixes from audit:
-#   - Issue 4: P&L computed from actual fill_price × size, not stale usd_amount
-#   - Issue 6: candles_at_entry naming clarified (was entry_candle)
-#   - Issue 9: poll attempts increased 5→8, delay 2s→2.5s = 20s max wait
 
 import time
 from crypto_bot.exchange.public_api import (
@@ -17,20 +12,18 @@ from crypto_bot.exchange.public_api import (
 from crypto_bot.logging import supabase_logger
 from crypto_bot.logging.logger import log, log_error, log_warn
 from crypto_bot.notifications import discord
-from crypto_bot.state.state import record_win, record_loss
+from crypto_bot.state.state import record_win, record_loss, record_exit
 from crypto_bot.config.settings import (
     STOP_LOSS_PCT, TAKE_PROFIT_PCT, is_dry_run, get_min_buying_power_buffer,
+    get_atr_sl_multiplier, get_atr_tp_multiplier,
 )
+from crypto_bot.data.coingecko import compute_atr
 
-FILL_POLL_ATTEMPTS = 8     # up from 5 — Public has eventual consistency on order endpoint
-FILL_POLL_DELAY    = 2.5   # 8 × 2.5s = 20s max wait
+FILL_POLL_ATTEMPTS = 8
+FILL_POLL_DELAY    = 2.5
 
 
 def _poll_fill_price(account_id: str, order_id: str, fallback_price: float) -> tuple[float, float]:
-    """
-    Poll get_order() until the order is FILLED or attempts exhausted.
-    Returns (fill_price, filled_quantity).
-    """
     for attempt in range(1, FILL_POLL_ATTEMPTS + 1):
         try:
             order = get_order(account_id, order_id)
@@ -55,6 +48,40 @@ def _poll_fill_price(account_id: str, order_id: str, fallback_price: float) -> t
                 log_warn(f"[trader] Could not confirm fill for {order_id}: {e} — using quote price")
 
     return fallback_price, 0.0
+
+
+def _calculate_sl_tp(symbol: str, entry: float, run_id: str | None) -> tuple[float, float, str]:
+    """
+    Calculate stop loss and take profit levels.
+
+    Tries ATR-based scaling first (volatility-adaptive). If ATR fetch fails,
+    falls back to fixed percentages from settings.
+
+    Returns (stop_loss, take_profit, method_used).
+    """
+    try:
+        atr = compute_atr(symbol, period=14)
+        if atr is not None and atr > 0:
+            sl_mult = get_atr_sl_multiplier()
+            tp_mult = get_atr_tp_multiplier()
+            sl = entry - (sl_mult * atr)
+            tp = entry + (tp_mult * atr)
+            sl_pct = ((entry - sl) / entry) * 100
+            tp_pct = ((tp - entry) / entry) * 100
+            log(
+                f"[trader] {symbol} ATR={atr:.2f} → SL={sl:.2f} (-{sl_pct:.2f}%) "
+                f"TP={tp:.2f} (+{tp_pct:.2f}%)",
+                run_id,
+            )
+            return round(sl, 6), round(tp, 6), "ATR"
+    except Exception as e:
+        log_warn(f"[trader] ATR calc failed for {symbol}: {e} — falling back to fixed %", run_id)
+
+    # Fallback: fixed percentages
+    sl = round(entry * (1 - STOP_LOSS_PCT), 6)
+    tp = round(entry * (1 + TAKE_PROFIT_PCT), 6)
+    log(f"[trader] {symbol} using fixed SL={sl:.2f} TP={tp:.2f}", run_id)
+    return sl, tp, "FIXED"
 
 
 class Trader:
@@ -83,7 +110,6 @@ class Trader:
         if self._dry_run:
             log(f"[DRY RUN] Would BUY {symbol} ${usd_amount:.2f}", self.run_id)
         else:
-            # Buying power check
             try:
                 cash_bp = get_cash_buying_power(self._get_account_id())
                 buffer  = get_min_buying_power_buffer()
@@ -130,14 +156,11 @@ class Trader:
                 discord.notify_error(f"BUY {symbol}", str(e))
                 return
 
-        # Use actual filled quantity if available (issue 4 — was using stale usd_amount/entry)
         size_estimate = actual_qty if actual_qty else (usd_amount / fill_price)
 
-        sl = round(fill_price * (1 - STOP_LOSS_PCT), 6)
-        tp = round(fill_price * (1 + TAKE_PROFIT_PCT), 6)
+        # ATR-based SL/TP (with fallback to fixed %)
+        sl, tp, method = _calculate_sl_tp(symbol, fill_price, self.run_id)
 
-        # candles_at_entry (renamed from entry_candle for clarity, audit issue 6)
-        # By this point append_price has run, so price_history includes the entry candle.
         candles_at_entry = len(self.state.get("price_history", {}).get(symbol, []))
 
         self.positions[symbol] = {
@@ -147,14 +170,14 @@ class Trader:
             "stop_loss":        sl,
             "take_profit":      tp,
             "candles_at_entry": candles_at_entry,
-            # Keep legacy key for backward-compat with old state files
-            "entry_candle":     candles_at_entry,
+            "entry_candle":     candles_at_entry,  # legacy compat
+            "exit_method":      method,            # "ATR" or "FIXED" — for analysis
         }
 
         mode = "DRY RUN " if self._dry_run else ""
         log(
             f"{mode}BUY  {symbol} | fill={fill_price:.2f} | amount=${usd_amount:.2f} | "
-            f"qty={size_estimate:.8f} | SL={sl:.2f} TP={tp:.2f}",
+            f"qty={size_estimate:.8f} | SL={sl:.2f} TP={tp:.2f} ({method})",
             self.run_id,
         )
 
@@ -187,7 +210,6 @@ class Trader:
         if self._dry_run:
             log(f"[DRY RUN] Would SELL {symbol} qty={size_estimate:.8f}", self.run_id)
         else:
-            # Get real position quantity from Public to avoid short-position errors
             try:
                 real_qty = get_crypto_position_quantity(self._get_account_id(), symbol)
                 if real_qty is not None and real_qty > 0:
@@ -234,9 +256,7 @@ class Trader:
                 discord.notify_error(f"SELL {symbol}", str(e))
                 return
 
-        # ── P&L from actual quantities (issue 4 fix) ──
-        # Old: pnl = (fill / entry - 1) * usd_amount  ← used stale notional
-        # New: proceeds - cost using ACTUAL size_estimate (potentially partial fill)
+        # P&L from actual quantities
         proceeds = fill_price  * size_estimate
         cost     = entry_price * size_estimate
         pnl      = proceeds - cost
@@ -255,6 +275,9 @@ class Trader:
             record_win(self.state, symbol)
         else:
             record_loss(self.state, symbol)
+
+        # Mark cooldown — block re-entry for COOLDOWN_CANDLES
+        record_exit(self.state, symbol)
 
         if not self._dry_run:
             discord.notify_sell(symbol, fill_price, pnl, reason)
