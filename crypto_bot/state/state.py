@@ -16,6 +16,9 @@ def _default_state() -> dict:
         "last_daily_summary": "",
         # Cooldown: candle index at which a position last closed per symbol
         "last_exit_candle":   {},
+        # Reconciliation: symbols where Public has crypto but state doesn't.
+        # When True, BUYs for that symbol are blocked.
+        "position_desync":    {},
     }
 
 
@@ -32,6 +35,7 @@ def load_state() -> dict:
         data.setdefault("circuit_notified",   {})
         data.setdefault("last_daily_summary", "")
         data.setdefault("last_exit_candle",   {})
+        data.setdefault("position_desync",    {})
         return data
     except (json.JSONDecodeError, OSError):
         return _default_state()
@@ -105,3 +109,24 @@ def candles_since_exit(state: dict, symbol: str) -> int | None:
         return None
     current = len(state.get("price_history", {}).get(symbol, []))
     return current - last_exit
+
+
+# ── Position desync tracking (NEW — startup reconciliation) ──────────────────
+# When the bot loads state and finds Public has crypto but state.json doesn't,
+# we mark the symbol as desynced and block all BUYs until manually resolved.
+
+def mark_position_desync(state: dict, symbol: str, real_qty: float) -> None:
+    """Flag a symbol as having a Public position not reflected in local state."""
+    state.setdefault("position_desync", {})[symbol] = {
+        "real_qty":   real_qty,
+        "detected_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def is_position_desynced(state: dict, symbol: str) -> bool:
+    return symbol in state.get("position_desync", {})
+
+
+def clear_position_desync(state: dict, symbol: str) -> None:
+    """Call when desync is resolved (e.g. position manually closed on Public)."""
+    state.setdefault("position_desync", {}).pop(symbol, None)

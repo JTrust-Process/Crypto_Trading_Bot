@@ -127,7 +127,18 @@ class Trader:
                     self.run_id,
                 )
             except Exception as e:
-                log_warn(f"[trader] Buying power check failed: {e} — proceeding with order", self.run_id)
+                # FAIL CLOSED — if we can't verify buying power, don't trade.
+                # Old behavior was to proceed; audit flagged this as risky.
+                # Better to skip a trade than to over-leverage during an API outage.
+                log_error(
+                    f"[trader] BUY {symbol} skipped — buying power check failed: {e}",
+                    self.run_id,
+                )
+                discord.notify_error(
+                    f"BUY {symbol}",
+                    f"Buying power check failed: {e}",
+                )
+                return
 
             try:
                 result   = place_order_buy(self._get_account_id(), symbol, usd_amount)

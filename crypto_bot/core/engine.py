@@ -19,6 +19,10 @@ from crypto_bot.state.state import (
     is_circuit_broken, get_consecutive_losses,
     should_notify_circuit_broken, mark_circuit_notified,
     candles_since_exit,
+    mark_position_desync, is_position_desynced, clear_position_desync,
+)
+from crypto_bot.exchange.public_api import (
+    get_primary_account_id, get_crypto_position_quantity,
 )
 from crypto_bot.logging.logger import log, log_warn, log_error
 from crypto_bot.logging.monitor import Monitor
@@ -35,6 +39,60 @@ def _get_price_with_retry(symbol: str, attempts: int = 3, delay: float = 2.0) ->
             else:
                 log_error(f"[engine] get_price({symbol}) failed after {attempts} attempts: {e}")
     return None
+
+
+def _reconcile_with_public(state: dict, symbols: list, run_id: str | None) -> None:
+    """
+    At startup, check Public's actual crypto holdings against local state.
+
+    If Public holds crypto for a symbol but local state has no position
+    (state.json reset, corruption, etc.), flag the symbol as desynced
+    and block all future BUYs for it until manually resolved.
+
+    If state has a position AND Public confirms it, clear any prior desync flag.
+
+    We never auto-restore positions because we don't know the real entry price
+    from Public's portfolio endpoint — better to block than guess wrong.
+    """
+    try:
+        account_id = get_primary_account_id()
+    except Exception as e:
+        log_error(f"[engine] reconcile failed — could not get account_id: {e}", run_id)
+        return
+
+    for symbol in symbols:
+        try:
+            real_qty = get_crypto_position_quantity(account_id, symbol)
+            local_has_position = symbol in state.get("positions", {})
+            real_has_position  = real_qty is not None and real_qty > 0
+
+            if real_has_position and real_qty is not None and not local_has_position:
+                # The dangerous case: Public has crypto we forgot about
+                if not is_position_desynced(state, symbol):
+                    mark_position_desync(state, symbol, real_qty)
+                    log_error(
+                        f"[engine] {symbol} DESYNC — Public holds {real_qty:.8f} but local state has no position. "
+                        f"BUYs blocked until resolved. Manually close on Public or restore state.",
+                        run_id,
+                    )
+                    if not is_dry_run():
+                        discord.notify_error(
+                            f"{symbol} POSITION DESYNC",
+                            f"Public has {real_qty:.8f} {symbol} but bot state has no position. "
+                            f"BUYs are now blocked for {symbol}. Manually close the position on Public, "
+                            f"then the desync will clear on next run.",
+                        )
+                else:
+                    qty_str = f"{real_qty:.8f}" if real_qty is not None else "unknown"
+                    log_warn(f"[engine] {symbol} still desynced (real_qty={qty_str})", run_id)
+
+            elif not real_has_position and is_position_desynced(state, symbol):
+                # Desync was resolved (manual close on Public)
+                clear_position_desync(state, symbol)
+                log(f"[engine] {symbol} desync cleared — Public no longer holds {symbol}", run_id)
+
+        except Exception as e:
+            log_warn(f"[engine] reconcile {symbol} failed: {e}", run_id)
 
 
 def run(monitor: Monitor, run_id: str | None) -> None:
@@ -55,6 +113,11 @@ def run(monitor: Monitor, run_id: str | None) -> None:
         f"open_positions={list(state['positions'].keys())}",
         run_id,
     )
+
+    # Reconcile against Public BEFORE any trade decisions.
+    # Catches the worst case: state.json reset while Public still holds positions.
+    if not dry_run:
+        _reconcile_with_public(state, symbols, run_id)
 
     trader = Trader(state, run_id)
     risk   = RiskManager(state)
@@ -129,10 +192,22 @@ def run(monitor: Monitor, run_id: str | None) -> None:
                 trader.sell(symbol, price, exit_reason)
                 continue
 
-            # 2. Strategy BUY — gated by regime + cooldown + gap quality
+            # 2. Strategy BUY — gated by desync + cooldown + regime + gap quality
             if signal == "BUY" and not in_position:
 
-                # 2a. Cooldown check — block re-entry for N candles after exit
+                # 2a. Desync gate — refuse to buy if Public has crypto we don't track
+                if is_position_desynced(state, symbol):
+                    log_warn(
+                        f"{symbol} | BUY signal suppressed — POSITION DESYNC (Public has untracked crypto)",
+                        run_id,
+                    )
+                    monitor.log_event(
+                        run_id, "filtered",
+                        f"{symbol} desync block",
+                    )
+                    continue
+
+                # 2b. Cooldown check — block re-entry for N candles after exit
                 since_exit = candles_since_exit(state, symbol)
                 if since_exit is not None and since_exit < cooldown:
                     log(
@@ -146,7 +221,7 @@ def run(monitor: Monitor, run_id: str | None) -> None:
                     )
                     continue
 
-                # 2b. Regime check — only trade in confirmed uptrends
+                # 2c. Regime check — only trade in confirmed uptrends (or warmup blocks)
                 is_uptrend, reason = regime_check(prices)
                 if not is_uptrend:
                     log(
@@ -159,7 +234,7 @@ def run(monitor: Monitor, run_id: str | None) -> None:
                     )
                     continue
 
-                # 2c. Gap quality — filter weak crossovers
+                # 2d. Gap quality — filter weak crossovers
                 if gap_pct < min_gap_pct:
                     log(
                         f"{symbol} | BUY signal suppressed — gap {gap_pct*100:.3f}% < "

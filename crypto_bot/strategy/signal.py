@@ -70,17 +70,20 @@ def regime_check(prices: list) -> tuple[bool, str]:
     Returns (is_uptrend, reason).
 
     is_uptrend = True  → market is trending up; BUY signals allowed
-    is_uptrend = False → market is ranging/bearish; HOLD all BUY signals
+    is_uptrend = False → market is ranging/bearish OR warming up; HOLD all BUY signals
 
     Conditions for uptrend:
       1. Current price > EMA50  (price is above the trend line)
       2. EMA50 is RISING  (compare current vs N candles ago)
 
-    If we don't have enough data yet (< 50 prices), default to allowing trades
-    (don't lock the bot out forever during warmup).
+    During warmup (< 55 prices), we BLOCK buys rather than allow them.
+    Audit found this to be a real safety issue: if state.json ever resets
+    mid-deployment, the bot would happily buy with no trend filter active.
+    Blocking during warmup means safer first hours after any state reset,
+    at the cost of ~14 hours of "no trades" after first deploy.
     """
     if len(prices) < REGIME_EMA_PERIOD + REGIME_LOOKBACK:
-        return True, f"insufficient data for regime filter ({len(prices)}/{REGIME_EMA_PERIOD + REGIME_LOOKBACK})"
+        return False, f"warming up regime filter ({len(prices)}/{REGIME_EMA_PERIOD + REGIME_LOOKBACK} prices)"
 
     ema50      = ema(prices, REGIME_EMA_PERIOD)
     current    = prices[-1]

@@ -10,6 +10,12 @@ on:
     - cron: "*/15 * * * *"
   workflow_dispatch:
 
+# Prevent overlapping runs — without this, two cron triggers could
+# execute simultaneously and place duplicate orders.
+concurrency:
+  group: crypto-bot
+  cancel-in-progress: true
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
