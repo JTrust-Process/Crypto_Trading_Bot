@@ -22,7 +22,7 @@ jobs:
     timeout-minutes: 10
 
     env:
-      SYMBOLS: "BTC,ETH"
+      SYMBOLS: "BTC"
       INITIAL_CAPITAL: "50"
       RISK_PER_TRADE: "0.02"
       STOP_LOSS_PCT: "0.03"        # fallback only — used if ATR fetch fails
