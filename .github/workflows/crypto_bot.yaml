@@ -14,7 +14,7 @@ on:
 # execute simultaneously and place duplicate orders.
 concurrency:
   group: crypto-bot
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   run-bot:
