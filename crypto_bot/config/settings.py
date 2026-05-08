@@ -83,6 +83,7 @@ def _int_env(key: str, default: int) -> int:
     except ValueError:
         return default
 
+def get_initial_capital()         -> float: return _float_env("INITIAL_CAPITAL",         INITIAL_CAPITAL)
 def get_max_order_usd()           -> float: return _float_env("MAX_ORDER_AMOUNT_USD",    MAX_ORDER_AMOUNT_USD)
 def get_circuit_breaker_losses()  -> int:   return _int_env  ("CIRCUIT_BREAKER_LOSSES",  CIRCUIT_BREAKER_LOSSES)
 def get_price_history_size()      -> int:   return _int_env  ("PRICE_HISTORY_SIZE",      PRICE_HISTORY_SIZE)

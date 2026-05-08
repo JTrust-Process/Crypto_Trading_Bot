@@ -15,7 +15,18 @@ INSTRUMENT_TYPE = "CRYPTO"
 _access_token: str | None = None
 
 
+def _invalidate_token() -> None:
+    """Clear the cached bearer so the next call re-authenticates."""
+    global _access_token
+    _access_token = None
+
+
 def _raise_with_body(resp: requests.Response) -> None:
+    # Audit H2: on 401 we drop the cached token before raising so the
+    # retry decorator's next attempt mints a fresh one. Without this the
+    # process would keep replaying a dead bearer until the run timed out.
+    if resp.status_code == 401:
+        _invalidate_token()
     if resp.status_code >= 400:
         raise RuntimeError(
             f"HTTP {resp.status_code} from {resp.url}\n"
@@ -158,7 +169,15 @@ def place_order_sell(
 
 @retry(max_attempts=3, delay=2)
 def get_order(account_id: str, order_id: str) -> dict:
-    """Poll for order fill status after placing an order."""
+    """Poll for order fill status after placing an order.
+
+    Audit M2: verify against Public's current API docs that the path is
+    `/order/{order_id}` and not `/orders/{order_id}` — both spellings appear
+    in different broker APIs. If this returns 404 in your bot_errors table,
+    that's where to look first. _poll_fill_price degrades gracefully (uses
+    the quote price as fallback), so a wrong URL won't break trades, but
+    you will lose averagePrice accuracy and post-fill quantity verification.
+    """
     url = f"https://api.public.com/userapigateway/trading/{account_id}/order/{order_id}"
     resp = requests.get(url, headers=_headers(), timeout=30)
     _raise_with_body(resp)

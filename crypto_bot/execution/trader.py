@@ -50,14 +50,16 @@ def _poll_fill_price(account_id: str, order_id: str, fallback_price: float) -> t
     return fallback_price, 0.0
 
 
-def _calculate_sl_tp(symbol: str, entry: float, run_id: str | None) -> tuple[float, float, str]:
+def compute_stop_levels(symbol: str, entry: float, run_id: str | None) -> tuple[float, float, str]:
     """
-    Calculate stop loss and take profit levels.
+    Calculate stop loss and take profit levels for a hypothetical entry at
+    `entry`. Used by both the engine (BEFORE position sizing — audit C3) and
+    by trader.buy() if a pre-computed value isn't supplied.
 
     Tries ATR-based scaling first (volatility-adaptive). If ATR fetch fails,
     falls back to fixed percentages from settings.
 
-    Returns (stop_loss, take_profit, method_used).
+    Returns (stop_loss, take_profit, method_used).  method_used is "ATR" or "FIXED".
     """
     try:
         atr = compute_atr(symbol, period=14)
@@ -84,6 +86,19 @@ def _calculate_sl_tp(symbol: str, entry: float, run_id: str | None) -> tuple[flo
     return sl, tp, "FIXED"
 
 
+# Backwards-compatible alias — kept so any external callers (research scripts,
+# notebooks) that imported the old name don't break.
+_calculate_sl_tp = compute_stop_levels
+
+
+def stop_pct_from_levels(entry: float, stop_loss: float) -> float:
+    """Helper: return |entry - stop_loss| / entry as a fraction.
+    Used by RiskManager.position_size_usd for accurate sizing."""
+    if entry <= 0:
+        return 0.0
+    return max(0.0, (entry - stop_loss) / entry)
+
+
 class Trader:
     def __init__(self, state: dict, run_id: str | None = None):
         self.state       = state
@@ -103,7 +118,19 @@ class Trader:
         return self._account_id
 
     # ── BUY ────────────────────────────────────────────────────────────────────
-    def buy(self, symbol: str, price: float, usd_amount: float) -> None:
+    def buy(
+        self,
+        symbol: str,
+        price: float,
+        usd_amount: float,
+        sl_tp: tuple[float, float, str] | None = None,
+    ) -> None:
+        """
+        Audit C3: callers may now pass pre-computed (sl, tp, method) so the
+        same ATR result that drove sizing is also used as the stop/target —
+        avoids double-computation and a possible drift between sizing and
+        stop placement if ATR changed between calls.
+        """
         fill_price = price
         actual_qty: float | None = None
         order_id:   str | None   = None  # captured from API response, saved to Supabase
@@ -170,8 +197,13 @@ class Trader:
 
         size_estimate = actual_qty if actual_qty else (usd_amount / fill_price)
 
-        # ATR-based SL/TP (with fallback to fixed %)
-        sl, tp, method = _calculate_sl_tp(symbol, fill_price, self.run_id)
+        # ATR-based SL/TP (with fallback to fixed %).
+        # If the engine pre-computed (to drive position sizing), reuse those
+        # values rather than calling compute_atr() a second time.
+        if sl_tp is not None:
+            sl, tp, method = sl_tp
+        else:
+            sl, tp, method = compute_stop_levels(symbol, fill_price, self.run_id)
 
         candles_at_entry = len(self.state.get("price_history", {}).get(symbol, []))
 
@@ -264,14 +296,64 @@ class Trader:
                     if filled_qty > 0:
                         size_estimate = filled_qty
 
+                # ─── Audit C2: partial-fill protection ───────────────────────
+                # Re-query post-trade quantity from Public. If anything is
+                # still on the books for this symbol, the SELL was partial.
+                # We compute PnL on what *did* fill and KEEP the position
+                # with the remaining size so the next cycle can finish it
+                # (or hit SL/TP normally). Without this guard the bot would
+                # delete the local position while Public still held crypto,
+                # producing wrong PnL and a permanent DESYNC flag.
+                try:
+                    remaining = get_crypto_position_quantity(self._get_account_id(), symbol)
+                except Exception as e:
+                    remaining = None
+                    log_warn(
+                        f"[trader] SELL {symbol} post-trade quantity check failed: {e} "
+                        f"— assuming full fill",
+                        self.run_id,
+                    )
+
             except Exception as e:
                 log_error(f"[trader] SELL {symbol} failed: {e}", self.run_id)
                 discord.notify_error(f"SELL {symbol}", str(e))
                 return
 
+        # ─── Partial fill handling (C2) ───────────────────────────────────────
+        # `remaining` is the qty Public still holds after the SELL.
+        # - DRY_RUN path: skipped (no real order placed).
+        # - Live path with `remaining is None`: portfolio check failed; fall
+        #   back to the legacy "treat as full fill" behavior, which is at
+        #   worst the same as before this fix.
+        partial_fill = False
+        if not self._dry_run and remaining is not None and remaining > 0:
+            partial_fill = True
+            sold_qty = max(0.0, size_estimate - remaining)
+            if sold_qty <= 0:
+                # Nothing actually sold — bail out without deleting the
+                # position or recording an exit. Next cycle will retry.
+                log_warn(
+                    f"[trader] SELL {symbol} appears to have filled 0 (remaining={remaining:.8f}, "
+                    f"requested={size_estimate:.8f}) — leaving position intact",
+                    self.run_id,
+                )
+                discord.notify_error(
+                    f"SELL {symbol}",
+                    f"Order returned but no fill detected (still holding {remaining:.8f}).",
+                )
+                return
+            log_warn(
+                f"[trader] SELL {symbol} partial fill: sold {sold_qty:.8f}, "
+                f"{remaining:.8f} still held — keeping position open with reduced size",
+                self.run_id,
+            )
+            size_estimate = sold_qty  # PnL only on what actually filled
+
         # P&L from actual quantities, then subtract round-trip fees.
         # Public charges per-order (BUY + SELL = 2 × fee). DRY_RUN trades
         # incur no real fees so we leave gross P&L alone in that mode.
+        # On a partial fill we still pay both fees: the BUY happened in full
+        # at entry, and the SELL leg is one (incomplete) order.
         gross_proceeds = fill_price  * size_estimate
         gross_cost     = entry_price * size_estimate
         gross_pnl      = gross_proceeds - gross_cost
@@ -286,13 +368,30 @@ class Trader:
         mode = "DRY RUN " if self._dry_run else ""
         log(
             f"{mode}SELL {symbol} | fill={fill_price:.2f} | qty={size_estimate:.8f} | "
-            f"gross={gross_pnl:+.4f} fees=${fees:.2f} net={pnl:+.4f} | reason={reason}",
+            f"gross={gross_pnl:+.4f} fees=${fees:.2f} net={pnl:+.4f} | reason={reason}"
+            f"{' (PARTIAL)' if partial_fill else ''}",
             self.run_id,
         )
 
         full_reason = f"DRY_RUN/{reason}" if self._dry_run else reason
+        if partial_fill:
+            full_reason = f"{full_reason}/partial"
         supabase_logger.log_trade(symbol, "SELL", fill_price, size_estimate, pnl, full_reason, self.run_id, order_id=order_id)
 
+        # Capital reflects only realised PnL (regardless of partial vs full).
+        self.state["capital"] = self.state.get("capital", 0.0) + pnl
+
+        if partial_fill:
+            # Keep the position with the residual size so the next cycle can
+            # close it. Don't record a win/loss yet (the trade isn't over),
+            # don't record an exit (cooldown shouldn't start), don't send a
+            # buy/sell notification — log + Supabase row are enough audit
+            # until the position is fully unwound.
+            self.positions[symbol]["size_estimate"] = remaining
+            self.positions[symbol]["usd_amount"]    = remaining * entry_price
+            return
+
+        # Full fill path — original behavior.
         if pnl >= 0:
             record_win(self.state, symbol)
         else:
@@ -304,7 +403,6 @@ class Trader:
         if not self._dry_run:
             discord.notify_sell(symbol, fill_price, pnl, reason)
 
-        self.state["capital"] = self.state.get("capital", 0.0) + pnl
         del self.positions[symbol]
 
     def check_exit(self, symbol: str, price: float) -> str | None:

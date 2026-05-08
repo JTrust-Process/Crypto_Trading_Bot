@@ -148,19 +148,22 @@ def notify_daily_summary(
         "Positions": ", ".join(positions.keys()) if positions else "None",
     }
 
+    # Audit L6: reuse the canonical EMA helper from signal.py so the gap
+    # shown in the daily summary matches what the trading logic computes.
+    # Previously this seeded from prices[0]; signal.py uses an SMA seed.
+    from crypto_bot.strategy.signal import ema as _ema
+    from crypto_bot.config.settings import EMA_FAST, EMA_SLOW
+
     for sym in symbols:
         prices = price_history.get(sym, [])
-        if len(prices) >= 22:
-            k9, k21 = 2 / 10, 2 / 22
-            ema9, ema21 = [prices[0]], [prices[0]]
-            for p in prices[1:]:
-                ema9.append(p * k9 + ema9[-1] * (1 - k9))
-                ema21.append(p * k21 + ema21[-1] * (1 - k21))
-            gap = ema9[-1] - ema21[-1]
+        if len(prices) >= EMA_SLOW + 1:
+            ema_fast = _ema(prices, EMA_FAST)
+            ema_slow = _ema(prices, EMA_SLOW)
+            gap = ema_fast[-1] - ema_slow[-1]
             direction = "↑ bullish" if gap > 0 else "↓ bearish"
             fields[f"{sym} EMA gap"] = f"{gap:+.2f} ({direction})"
         else:
-            fields[f"{sym} EMA"] = f"Warming up ({len(prices)}/22)"
+            fields[f"{sym} EMA"] = f"Warming up ({len(prices)}/{EMA_SLOW + 1})"
 
         if prices:
             fields[f"{sym} Price"] = f"${prices[-1]:,.2f}"

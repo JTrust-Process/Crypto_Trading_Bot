@@ -1,21 +1,20 @@
 # Crypto Trading Bot
 
-An automated EMA crossover trading bot for BTC and ETH, built on Public brokerage's API. Runs on GitHub Actions every 15 minutes, 24/7. Logs everything to Supabase. Sends Discord notifications on trades and daily summaries.
+An automated EMA-crossover trading bot for BTC and ETH on the Public.com brokerage API. Runs on GitHub Actions every 15 minutes (cron offset minutes), 24/7. Logs runs, events, errors, logs, and trades to Supabase. Sends Discord notifications on trades, daily summaries, and operator-relevant warnings.
 
 ---
 
 ## How it works
 
-Every 15 minutes GitHub Actions triggers a single bot cycle:
+Every 15 minutes (`7,22,37,52 * * * *`) a GitHub Actions cron triggers a single bot cycle:
 
-1. Fetches current BTC and ETH prices from Public API
-2. Appends price to a rolling 50-candle history stored in GHA cache (`state.json`)
-3. Calculates EMA 9 and EMA 21 from the price history
-4. If EMA9 crosses above EMA21 → **BUY** signal
-5. If EMA9 crosses below EMA21 while in position → **SELL** signal
-6. Hard exits always checked first: **stop-loss at -3%**, **take-profit at +5%**
-7. All trades, runs, events, and errors logged to Supabase
-8. Discord webhook pinged on every trade + daily summary each morning
+1. Loads `state.json` from the GHA cache (or from a Supabase fallback row if the cache missed).
+2. Reconciles state against Public's portfolio: if Public holds crypto we don't track, the symbol is marked DESYNC and BUYs are blocked until manually resolved.
+3. For each symbol it fetches the spot price from Public, appends to a rolling 80-candle history, and computes EMA9 / EMA21.
+4. Hard exits fire first — ATR-based stop-loss / take-profit (with fixed-percent fallback if ATR fetch fails).
+5. New entries require: not in cooldown, regime-up (price > EMA50 and EMA50 rising), and a minimum EMA gap. ATR drives both the stop distance AND the position size, so risk-per-trade reflects the real stop, not a fixed assumption.
+6. Strategy SELLs require minimum hold candles and minimum profit (so fees don't eat the trade).
+7. Run lifecycle, every log line, every event, every error, and every trade goes to Supabase. The Next.js dashboard reads from there.
 
 ---
 
@@ -24,11 +23,12 @@ Every 15 minutes GitHub Actions triggers a single bot cycle:
 | Layer | Technology |
 |---|---|
 | Exchange | [Public.com](https://public.com) brokerage API |
-| Scheduler | GitHub Actions (cron `*/15 * * * *`) |
-| State | `state.json` persisted via GHA cache |
+| Scheduler | GitHub Actions (cron `7,22,37,52 * * * *`) |
+| State | `state.json` via GHA cache, with Supabase fallback (`bot_state` table) |
+| ATR data | CoinGecko free OHLC (with fixed-pct fallback if rate-limited) |
 | Database | Supabase (PostgreSQL) |
 | Notifications | Discord webhook |
-| Dashboard | Next.js on Vercel |
+| Dashboard | Next.js (see `../CryptoBot_Dashboard`) |
 | Language | Python 3.11 |
 
 ---
@@ -37,63 +37,85 @@ Every 15 minutes GitHub Actions triggers a single bot cycle:
 
 ```
 crypto_bot/
-├── core/
-│   └── engine.py          # Main cycle logic — one run per GHA trigger
-├── config/
-│   └── settings.py        # All config — lazy env var loading, no module-level os.getenv()
-├── data/
-│   └── market_data.py     # Price fetching from Public API
-├── exchange/
-│   └── public_api.py      # Public API client — auth, quotes, order placement
-├── execution/
-│   └── trader.py          # Buy/sell execution with DRY_RUN support
-├── strategy/
-│   └── signal.py          # EMA 9/21 crossover signal generation
-├── risk/
-│   └── manager.py         # Position sizing with hard USD cap
-├── state/
-│   └── state.py           # state.json read/write — prices, positions, capital
-├── logging/
-│   ├── logger.py          # append_log() — stdout + CSV + Supabase
-│   ├── monitor.py         # Run lifecycle tracking (bot_runs table)
-│   └── supabase_logger.py # Trade logging (crypto_trades table)
-├── notifications/
-│   └── discord.py         # Discord webhook — trades + daily summary
-└── utils/
-    └── retry.py           # Retry decorator for API calls
-
-main.py                    # Entry point — try/finally guarantees end_run() always fires
-requirements.txt
-.github/workflows/crypto_bot.yml
+├── core/engine.py          # Per-cycle orchestration: reconcile → signal → filter → exec
+├── config/settings.py      # Lazy env vars; all os.getenv() reads happen post-load_dotenv
+├── data/market_data.py     # Public spot quote wrapper
+├── data/coingecko.py       # OHLC + ATR (free tier, in-process cache)
+├── exchange/public_api.py  # Public API client — auth, quotes, orders, portfolio
+├── execution/trader.py     # buy / sell, fill polling, partial-fill handling, SL/TP calc
+├── strategy/signal.py      # EMA9/21 crossover + EMA50 regime check
+├── risk/manager.py         # Position sizing using actual ATR-derived stop
+├── state/state.py          # state.json read/write — local primary
+├── state/remote.py         # Supabase mirror — recovery for cache miss
+├── logging/_supabase.py    # Shared Supabase client
+├── logging/logger.py       # log/log_warn/log_error → stdout + bot_logs
+├── logging/monitor.py      # bot_runs lifecycle + bot_events + bot_errors
+├── logging/supabase_logger # crypto_trades inserts
+├── notifications/discord.py
+└── utils/retry.py
+main.py                     # Entry point — try/except/finally with correct status passing
+.github/workflows/crypto_bot.yaml
+supabase/migrations/        # 001_create_bot_tables, 002_fix_rls, 003_bot_state
 ```
 
 ---
 
-## Signal logic
+## Strategy
+
+EMA crossover with regime + ATR + cooldown filters:
 
 ```
-Warmup: first 22 price readings → signal always HOLD
-After warmup:
-  EMA9 crosses above EMA21 + not in position → BUY
-  EMA9 crosses below EMA21 + in position     → SELL
-  Otherwise                                  → HOLD
+Warmup: signal needs EMA_SLOW + 2 = 23 prices.
+Regime filter needs EMA50 + lookback = 55 prices (~14 hrs at 15-min cadence).
 
-At 15-min intervals: ~5.5 hours to complete warmup
+Entry:
+  EMA9 crosses above EMA21
+  AND not in position
+  AND not desynced with Public
+  AND past cooldown (4 candles after last exit)
+  AND regime-up (price > EMA50, EMA50 rising over last 5 candles)
+  AND |EMA9 − EMA21| / price ≥ MIN_SIGNAL_GAP_PCT
+
+Strategy exit:
+  EMA9 crosses below EMA21
+  AND in position
+  AND held ≥ MIN_HOLD_CANDLES
+  AND unrealised gain ≥ MIN_SIGNAL_PROFIT_PCT (so fees don't eat profit)
+
+Hard exit (always fires):
+  Price hits ATR-based SL or TP, or fixed-% fallback if ATR fetch failed.
 ```
 
 ---
 
 ## Risk management
 
-| Parameter | Value | Description |
+| Parameter | Default | Description |
 |---|---|---|
-| `RISK_PER_TRADE` | 2% | Fraction of capital risked per trade |
-| `STOP_LOSS_PCT` | 3% | Hard stop-loss below entry |
-| `TAKE_PROFIT_PCT` | 5% | Hard take-profit above entry |
-| `MAX_ORDER_AMOUNT_USD` | $10 | Hard cap per order regardless of capital |
+| `RISK_PER_TRADE` | 0.02 | Fraction of capital risked per trade |
+| `STOP_LOSS_PCT` | 0.03 | Fallback stop-loss when ATR is unavailable |
+| `TAKE_PROFIT_PCT` | 0.05 | Fallback take-profit when ATR is unavailable |
+| `MAX_ORDER_AMOUNT_USD` | 25 | Hard cap per order regardless of capital |
+| `MIN_BUYING_POWER_BUFFER` | 25 | Don't trade if cash would drop below this |
 | `CIRCUIT_BREAKER_LOSSES` | 3 | Pause symbol after N consecutive losses |
+| `ATR_PERIOD` | 14 | ATR averaging window |
+| `ATR_SL_MULTIPLIER` | 2.0 | SL = entry − 2 × ATR |
+| `ATR_TP_MULTIPLIER` | 4.0 | TP = entry + 4 × ATR (2:1 reward:risk) |
+| `COOLDOWN_CANDLES` | 4 | Block re-entry for ~1hr after exit |
+| `MIN_SIGNAL_GAP_PCT` | 0.0015 | Reject weak crossovers below this gap |
+| `MIN_SIGNAL_PROFIT_PCT` | 0.03 | Reject SELLs that wouldn't beat fees |
+| `MIN_HOLD_CANDLES` | 4 | Don't strategy-exit before this many candles held |
+| `CRYPTO_FEE_PER_ORDER` | 0.06 | Public's per-order fee — round-trip subtracted from PnL |
 
-Position size formula: `(capital × risk_pct) / stop_loss_pct`, capped at `MAX_ORDER_AMOUNT_USD`.
+Position size formula (post-audit C3):
+
+```
+risk_amount  = capital × RISK_PER_TRADE
+usd_to_spend = risk_amount / actual_stop_pct       # ATR-derived; falls back to STOP_LOSS_PCT
+usd_to_spend = min(usd_to_spend, capital, MAX_ORDER_AMOUNT_USD)
+```
+
+Buying power is checked against Public's `cashOnlyBuyingPower` before any BUY. If the check fails, the trade is skipped (fail-closed).
 
 ---
 
@@ -101,89 +123,109 @@ Position size formula: `(capital × risk_pct) / stop_loss_pct`, capped at `MAX_O
 
 | Table | Description |
 |---|---|
-| `bot_runs` | One row per GHA trigger — start time, end time, status |
-| `bot_events` | Signals fired, buys, sells, exits |
-| `bot_errors` | Exceptions caught during a run |
-| `bot_logs` | Full stdout mirror |
-| `crypto_trades` | Every buy and sell with price, size, P&L, reason |
+| `bot_runs` | One row per GHA trigger — start, end, status (`running` / `completed` / `error`) |
+| `bot_logs` | Full stdout mirror with level (INFO/WARN/ERROR) |
+| `bot_events` | Discrete events: signals, buys, sells, exits, filtered, circuit_breaker |
+| `bot_errors` | Caught exceptions with run_id and context |
+| `crypto_trades` | Every BUY and SELL with price, size, pnl, reason, order_id |
+| `bot_state` | One row per branch — JSONB mirror of `state.json` for cache-miss recovery |
 
-Run `supabase/migrations/001_create_bot_tables.sql` to create all tables. Run `supabase/migrations/002_fix_rls.sql` to configure row-level security (anon key read-only, service role write).
+Apply migrations in order:
+
+```
+supabase/migrations/001_create_bot_tables.sql
+supabase/migrations/002_fix_rls.sql        # anon read-only, service role writes
+supabase/migrations/003_bot_state.sql      # state mirror
+```
 
 ---
 
 ## Environment variables
 
-### GitHub Secrets (never commit these)
+### GitHub Secrets (do not commit)
 
 | Secret | Description |
 |---|---|
 | `PUBLIC_SECRET` | Secret key from public.com → Settings → Security → API |
 | `SUPABASE_URL` | Supabase project URL |
-| `SUPABASE_KEY` | Supabase service role key |
+| `SUPABASE_KEY` | Supabase **service-role** key (RLS bypass) |
 | `DISCORD_WEBHOOK_URL` | Discord channel webhook URL |
 
-### Workflow env vars (non-secrets, visible in repo)
+### Workflow `env:` (set in `.github/workflows/crypto_bot.yaml`)
 
-| Variable | Default | Description |
+| Variable | Default | Notes |
 |---|---|---|
-| `SYMBOLS` | `BTC,ETH` | Comma-separated symbols to trade |
-| `INITIAL_CAPITAL` | `15` | Starting capital in USD |
-| `RISK_PER_TRADE` | `0.02` | Risk fraction per trade |
-| `STOP_LOSS_PCT` | `0.03` | Stop-loss percentage |
-| `TAKE_PROFIT_PCT` | `0.05` | Take-profit percentage |
-| `MAX_ORDER_AMOUNT_USD` | `10` | Hard cap per order |
-| `CIRCUIT_BREAKER_LOSSES` | `3` | Consecutive losses before pausing |
-| `DRY_RUN` | `0` | Set to `1` for paper trading |
-| `RUN_ONCE` | `1` | Exit after one cycle (always 1 for GHA) |
+| `SYMBOLS` | `BTC` | Comma-separated. Currently BTC only in workflow; settings module supports BTC,ETH |
+| `INITIAL_CAPITAL` | `50` | Used only on first ever run (when state.json is empty) |
+| `RISK_PER_TRADE` | `0.02` | Fraction of capital |
+| `STOP_LOSS_PCT` | `0.03` | Fallback only — ATR usually drives the real stop |
+| `TAKE_PROFIT_PCT` | `0.05` | Fallback only |
+| `MAX_ORDER_AMOUNT_USD` | `25` | Hard cap per order |
+| `MIN_BUYING_POWER_BUFFER` | `25` | Skip BUY if cash would drop below this |
+| `CIRCUIT_BREAKER_LOSSES` | `3` | Pause symbol after N consecutive losses |
+| `MIN_SIGNAL_GAP_PCT` | `0.0015` | Reject weak crossovers |
+| `MIN_SIGNAL_PROFIT_PCT` | `0.03` | Reject signal-SELLs below this |
+| `MIN_HOLD_CANDLES` | `4` | Min candles held before strategy SELL |
+| `ATR_PERIOD` | `14` | |
+| `ATR_SL_MULTIPLIER` | `2.0` | |
+| `ATR_TP_MULTIPLIER` | `4.0` | |
+| `COOLDOWN_CANDLES` | `4` | |
+| `DRY_RUN` | `0` | Set to `1` for paper trading (workflow value is the live default) |
 
 ---
 
 ## Local development
 
 ```bash
-# Clone and install
-git clone https://github.com/your-username/crypto-trading-bot
-cd crypto-trading-bot
+git clone <this-repo>
+cd Crypto_Trading_Bot
 pip install -r requirements.txt
 
-# Set up environment
-cp .env.example .env
-# Fill in PUBLIC_SECRET, SUPABASE_URL, SUPABASE_KEY, DISCORD_WEBHOOK_URL
+cp .env.example .env       # fill in your secrets
+# IMPORTANT: keep DRY_RUN=1 in .env — your local runs should never place real
+# orders by accident. The GitHub Actions workflow has its own DRY_RUN=0.
 
-# Paper trade locally (DRY_RUN=1 in .env)
 python main.py
 ```
 
+`state.json` and `.env` are gitignored. The committed `state.json` is just a placeholder default; if you have a stale local state.json from an earlier session, move it aside before running locally — see `state.json.local-bak` if you'd previously been holding live positions there.
+
 ---
 
-## Paper trading vs live trading
+## Paper vs live
 
-Set `DRY_RUN=1` in the workflow YAML to simulate trades without placing real orders. Paper trades are logged to Supabase with `reason` prefixed `DRY_RUN/` so they're clearly separated from live trades in the dashboard.
+| Mode | Where | DRY_RUN |
+|---|---|---|
+| Local paper | your machine | `1` (default in committed `.env`) |
+| Live cron | GitHub Actions | `0` (set in workflow YAML) |
+| Manual live test | Actions → run workflow | inherits workflow value |
 
-To go live: set `DRY_RUN=0` and push.
+Paper trades are still logged to Supabase with `reason` prefixed `DRY_RUN/` so they're separated from live trades on the dashboard.
 
 ---
 
 ## State persistence
 
-`state.json` is persisted between GHA runs using the Actions cache. It stores:
+The bot is stateless across runs except via `state.json`, which lives in:
+
+1. **Primary:** GitHub Actions cache, keyed by `crypto-bot-state-${branch}-${run_id}` with a prefix-based `restore-keys` so any branch run can pick up the most recent cache.
+2. **Fallback:** Supabase `bot_state` row keyed by branch (or `default` locally), upserted on every successful save. Read only when the local state.json is missing or unreadable. See `crypto_bot/state/remote.py` and migration 003.
+
+State shape:
 
 ```json
 {
-  "capital": 15.0,
-  "positions": {
-    "ETH": { "entry": 2221.20, "usd_amount": 10.0, "stop_loss": 2154.56, "take_profit": 2332.26 }
-  },
-  "price_history": {
-    "BTC": [71986.96, 71468.98, "...up to 50 prices"],
-    "ETH": [2244.58, 2238.62, "..."]
-  },
-  "consecutive_losses": { "BTC": 0, "ETH": 0 },
-  "last_daily_summary": "2025-04-13"
+  "capital": 50.0,
+  "positions": { "BTC": { "entry": ..., "usd_amount": ..., "size_estimate": ..., "stop_loss": ..., "take_profit": ..., "candles_at_entry": ..., "exit_method": "ATR" } },
+  "price_history": { "BTC": [..up to 80..] },
+  "consecutive_losses": { "BTC": 0 },
+  "circuit_notified": { "BTC": "2026-05-07" },
+  "last_daily_summary": "2026-05-07",
+  "last_exit_candle": { "BTC": 53 },
+  "position_desync": {},
+  "atr_fallback_notified": {}
 }
 ```
-
-`state.json` is gitignored — it only lives in the GHA cache.
 
 ---
 
@@ -191,32 +233,25 @@ To go live: set `DRY_RUN=0` and push.
 
 | Event | Trigger |
 |---|---|
-| 🟢 Buy order placed | EMA crossover BUY signal |
-| 🎯 Take profit | Price hits +5% from entry |
-| 🛑 Stop loss | Price hits -3% from entry |
-| 💰 Sell — profit | EMA crossover SELL with P&L > 0 |
-| 🔴 Sell — loss | EMA crossover SELL with P&L < 0 |
-| ⚡ Circuit breaker | 3 consecutive losses on a symbol |
-| ❌ Bot error | Any unhandled exception |
-| 📊 Daily summary | Once per day — capital, positions, EMA gaps, prices |
-
----
-
-## Dashboard
-
-Built with Next.js and deployed on Vercel. Reads from Supabase in real time (auto-refresh every 30s).
-
-Features: capital curve, P&L per trade, EMA gap tracker, open position cards with SL/TP progress bar, 7-day sparklines with trade markers, bot health strip, runs/errors explorer.
-
-See `/dashboard` for the source.
+| Buy order placed | EMA crossover BUY signal passing all filters |
+| Take profit | Price hits ATR-derived TP (or 5% fallback) |
+| Stop loss | Price hits ATR-derived SL (or 3% fallback) |
+| Sell — profit | Strategy SELL with PnL ≥ 0 |
+| Sell — loss | Strategy SELL with PnL < 0 |
+| Circuit breaker | 3 consecutive losses on a symbol |
+| Bot error | Any unhandled exception (caught at engine or symbol scope), or operator-relevant warnings (DESYNC detected, ATR fallback engaged, partial fill) |
+| Daily summary | Once per UTC day — capital, positions, EMA gaps, prices |
 
 ---
 
 ## Architecture patterns
 
-- **Lazy env var loading** — `os.getenv()` never called at module import time, only inside functions after `load_dotenv()` runs in `__main__`
-- **`try/finally` in `main.py`** — `monitor.end_run()` always fires even on crash
-- **`_log_to_supabase()` never crashes the bot** — all Supabase calls wrapped in try/except
-- **`place_order_buy` uses `amount` (USD notional), `place_order_sell` uses `quantity` (crypto units)** — required by Public API
-- **`RUN_ONCE=1`** — each GHA trigger is exactly one cycle, no `while True` loops
-- **Deterministic state** — all mutable state lives in `state.json`, never in memory between runs
+- **Lazy env-var loading** — `os.getenv()` is never called at module import, only inside functions, so `load_dotenv()` in `main.py` always runs first.
+- **`try/except/finally` with explicit run status** — `monitor.end_run()` receives the actual outcome, so the dashboard never shows a failed run as "completed" (audit C1).
+- **`safe_insert` wraps every Supabase write** — logging never crashes the bot; failures print to stdout for the GHA log.
+- **`place_order_buy` uses `amount` (USD notional)** while **`place_order_sell` uses `quantity` (crypto units)** — required by Public's API.
+- **Each cron trigger is one cycle** — no `while True` loops, no in-process scheduling. State lives in `state.json`.
+- **Reconcile before trade** — every cycle compares Public's portfolio against local state and blocks BUYs on any symbol where they diverge until manually resolved.
+- **Fail-closed on uncertainty** — buying-power check failure, reconcile failure, missing fill price, and missing portfolio quantity all skip the action rather than guess.
+- **Position sizing uses real stop distance** (audit C3) — risk-per-trade math reflects the ATR-derived stop, not a hardcoded percent.
+- **Partial-fill safe SELLs** (audit C2) — if Public still holds the symbol after a SELL, the position stays open with the residual size and PnL is computed only on what filled.

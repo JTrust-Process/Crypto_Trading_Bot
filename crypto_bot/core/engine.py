@@ -11,7 +11,7 @@ from crypto_bot.config.settings import (
 )
 from crypto_bot.data.market_data import get_price
 from crypto_bot.strategy.signal import generate_signal, regime_check, warmup_progress
-from crypto_bot.execution.trader import Trader
+from crypto_bot.execution.trader import Trader, compute_stop_levels, stop_pct_from_levels
 from crypto_bot.risk.manager import RiskManager
 from crypto_bot.state.state import (
     load_state, save_state,
@@ -20,6 +20,7 @@ from crypto_bot.state.state import (
     should_notify_circuit_broken, mark_circuit_notified,
     candles_since_exit,
     mark_position_desync, is_position_desynced, clear_position_desync,
+    should_notify_atr_fallback, mark_atr_fallback_notified,
 )
 from crypto_bot.exchange.public_api import (
     get_primary_account_id, get_crypto_position_quantity,
@@ -30,6 +31,9 @@ from crypto_bot.notifications import discord
 
 
 def _get_price_with_retry(symbol: str, attempts: int = 3, delay: float = 2.0) -> float | None:
+    # Audit M7: callers always pass at least 2 attempts now (see below) so a
+    # single transient failure no longer drops a candle entirely.
+    attempts = max(attempts, 2)
     for i in range(attempts):
         try:
             return get_price(symbol)
@@ -41,7 +45,7 @@ def _get_price_with_retry(symbol: str, attempts: int = 3, delay: float = 2.0) ->
     return None
 
 
-def _reconcile_with_public(state: dict, symbols: list, run_id: str | None) -> None:
+def _reconcile_with_public(state: dict, symbols: list, run_id: str | None) -> bool:
     """
     At startup, check Public's actual crypto holdings against local state.
 
@@ -53,13 +57,18 @@ def _reconcile_with_public(state: dict, symbols: list, run_id: str | None) -> No
 
     We never auto-restore positions because we don't know the real entry price
     from Public's portfolio endpoint — better to block than guess wrong.
+
+    Audit M6: now returns True on success / False on partial-or-total failure.
+    Caller uses the flag to suppress BUYs for the cycle when we couldn't
+    confirm the on-exchange state.
     """
     try:
         account_id = get_primary_account_id()
     except Exception as e:
         log_error(f"[engine] reconcile failed — could not get account_id: {e}", run_id)
-        return
+        return False
 
+    all_ok = True
     for symbol in symbols:
         try:
             real_qty = get_crypto_position_quantity(account_id, symbol)
@@ -93,6 +102,9 @@ def _reconcile_with_public(state: dict, symbols: list, run_id: str | None) -> No
 
         except Exception as e:
             log_warn(f"[engine] reconcile {symbol} failed: {e}", run_id)
+            all_ok = False
+
+    return all_ok
 
 
 def run(monitor: Monitor, run_id: str | None) -> None:
@@ -116,8 +128,15 @@ def run(monitor: Monitor, run_id: str | None) -> None:
 
     # Reconcile against Public BEFORE any trade decisions.
     # Catches the worst case: state.json reset while Public still holds positions.
+    # Audit M6: when reconcile fails (Public API hiccup, etc.) we suppress all
+    # BUYs for the cycle. Exits still fire — those should always run, even on
+    # stale state, because not selling a position the user wanted closed is
+    # strictly worse than skipping a new entry.
+    reconcile_ok = True
     if not dry_run:
-        _reconcile_with_public(state, symbols, run_id)
+        reconcile_ok = _reconcile_with_public(state, symbols, run_id)
+        if not reconcile_ok:
+            log_warn("[engine] Reconcile incomplete — BUYs suppressed for this cycle", run_id)
 
     trader = Trader(state, run_id)
     risk   = RiskManager(state)
@@ -129,6 +148,10 @@ def run(monitor: Monitor, run_id: str | None) -> None:
             price_history=state.get("price_history", {}),
             dry_run=dry_run,
         )
+        # Audit M5: persist immediately after sending so a crash later in
+        # the cycle doesn't cause us to re-send the same summary on the
+        # next run.
+        save_state(state)
         log("Daily Discord summary sent", run_id)
 
     # ── Process each symbol ───────────────────────────────────────────────────
@@ -192,8 +215,21 @@ def run(monitor: Monitor, run_id: str | None) -> None:
                 trader.sell(symbol, price, exit_reason)
                 continue
 
-            # 2. Strategy BUY — gated by desync + cooldown + regime + gap quality
+            # 2. Strategy BUY — gated by reconcile + desync + cooldown + regime + gap quality
             if signal == "BUY" and not in_position:
+
+                # 2.0. Reconcile gate (M6) — if we couldn't confirm Public's state at
+                # startup, skip BUYs this cycle. Exits still fired above.
+                if not reconcile_ok:
+                    log_warn(
+                        f"{symbol} | BUY signal suppressed — reconcile incomplete this cycle",
+                        run_id,
+                    )
+                    monitor.log_event(
+                        run_id, "filtered",
+                        f"{symbol} reconcile-fail block",
+                    )
+                    continue
 
                 # 2a. Desync gate — refuse to buy if Public has crypto we don't track
                 if is_position_desynced(state, symbol):
@@ -244,11 +280,37 @@ def run(monitor: Monitor, run_id: str | None) -> None:
                     monitor.log_event(run_id, "filtered", f"{symbol} weak BUY gap={gap_pct:.4f}")
                     continue
 
-                # All filters passed — execute
-                log(f"{symbol} | BUY filters passed — regime: {reason}", run_id)
-                usd_amount = risk.position_size_usd(price)
+                # All filters passed — execute.
+                #
+                # Audit C3: compute the actual stop *before* sizing so the
+                # risk-per-trade math uses the real stop distance instead of
+                # a hardcoded 3%. We pass the computed sl_tp through to the
+                # trader so it doesn't recompute (and possibly diverge from
+                # what we just sized for).
+                sl_lvl, tp_lvl, method = compute_stop_levels(symbol, price, run_id)
+                stop_pct = stop_pct_from_levels(price, sl_lvl)
+
+                # M3: alert (rate-limited per UTC day) when ATR fetch failed
+                # and we're falling back to the fixed % stop. Otherwise the
+                # bot silently behaves like the old strategy without anyone
+                # noticing CoinGecko is broken.
+                if method == "FIXED" and should_notify_atr_fallback(state, symbol):
+                    mark_atr_fallback_notified(state, symbol)
+                    if not dry_run:
+                        discord.notify_error(
+                            f"{symbol} ATR fallback",
+                            "ATR computation failed — using fixed % SL/TP for new entries. "
+                            "Check CoinGecko availability / rate limits.",
+                        )
+
+                log(
+                    f"{symbol} | BUY filters passed — regime: {reason} | "
+                    f"sizing with stop_pct={stop_pct*100:.2f}% ({method})",
+                    run_id,
+                )
+                usd_amount = risk.position_size_usd(price, stop_pct=stop_pct)
                 monitor.log_event(run_id, "buy", f"{symbol} ${usd_amount:.2f} at {price:.2f}")
-                trader.buy(symbol, price, usd_amount)
+                trader.buy(symbol, price, usd_amount, sl_tp=(sl_lvl, tp_lvl, method))
 
             # 3. Strategy SELL
             elif signal == "SELL" and in_position:
