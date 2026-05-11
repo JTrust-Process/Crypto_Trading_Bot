@@ -43,6 +43,10 @@ jobs:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
       DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      # ── Trading Bot League (additive — fail-silent if unreachable) ────
+      LEAGUE_SUPABASE_URL: ${{ secrets.LEAGUE_SUPABASE_URL }}
+      LEAGUE_SUPABASE_KEY: ${{ secrets.LEAGUE_SUPABASE_KEY }}
+      LEAGUE_BOT_ID: "crypto_ema_atr_v1"
 
     steps:
       - name: Checkout repo

@@ -11,10 +11,17 @@ load_dotenv()  # Must be first — all os.getenv() calls happen after this
 
 from crypto_bot.core.engine import run
 from crypto_bot.logging.monitor import Monitor
+from crypto_bot.league import league_status  # ADDITIVE — fail-silent League heartbeat. Touches NO trading logic.
 
 if __name__ == "__main__":
     monitor = Monitor()
     run_id = monitor.start_run()
+    # League heartbeat — additive, fail-silent. Does NOT affect monitor.start_run()
+    # or any trading logic. If the League project is unreachable, this no-ops.
+    try:
+        league_status.start_run("cron")
+    except Exception:
+        pass
     final_status = "completed"
     try:
         run(monitor, run_id)
@@ -29,3 +36,11 @@ if __name__ == "__main__":
         raise
     finally:
         monitor.end_run(run_id, status=final_status)
+        # League end_run — additive, fail-silent. Maps the crypto bot's
+        # "completed"/"error" vocabulary to League's "success"/"failed".
+        try:
+            league_status.end_run(
+                status=("success" if final_status == "completed" else "failed"),
+            )
+        except Exception:
+            pass
