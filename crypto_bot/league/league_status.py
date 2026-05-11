@@ -211,4 +211,68 @@ def end_run(
     _current_run_id = None
 
 
-__all__ = ["heartbeat", "start_run", "end_run"]
+# ── Trade mirror ────────────────────────────────────────────────────────────
+
+
+def log_trade(
+    symbol: str,
+    side: str,
+    *,
+    quantity: Optional[float] = None,
+    price: Optional[float] = None,
+    amount_usd: Optional[float] = None,
+    fees_usd: float = 0.0,
+    pnl_usd: Optional[float] = None,
+    pnl_pct: Optional[float] = None,
+    reason: Optional[str] = None,
+    strategy: Optional[str] = None,
+    is_paper: bool = False,
+    order_id: Optional[str] = None,
+    run_id: Optional[str] = None,
+    metadata: Optional[dict[str, Any]] = None,
+) -> None:
+    """Mirror a trade into the League's bot_trades table. Fail-silent.
+
+    Asset class is always 'crypto' for this bot. The unique partial index
+    on (bot_id, order_id) in the table makes repeat inserts of the same
+    Public order_id idempotent at the DB level. One shot per call.
+    """
+    cfg = _config()
+    if cfg is None:
+        return
+    side_u = (side or "").upper()
+    if side_u not in ("BUY", "SELL", "SHORT", "COVER"):
+        _print(f"log_trade: invalid side={side!r}; skipping")
+        return
+    rid = run_id if run_id is not None else _current_run_id
+    # Auto-compute amount_usd if both quantity and price are present and
+    # the caller didn't pass one explicitly — matches the crypto bot's
+    # convention where supabase_logger.log_trade takes price + size.
+    if amount_usd is None and quantity is not None and price is not None:
+        try:
+            amount_usd = float(quantity) * float(price)
+        except Exception:  # noqa: BLE001
+            amount_usd = None
+    row: dict[str, Any] = {
+        "bot_id":      cfg["bot_id"],
+        "run_id":      rid,
+        "occurred_at": _now_iso(),
+        "symbol":      symbol,
+        "asset_class": "crypto",
+        "side":        side_u,
+        "quantity":    quantity,
+        "price":       price,
+        "amount_usd":  amount_usd,
+        "fees_usd":    fees_usd or 0,
+        "pnl_usd":     pnl_usd,
+        "pnl_pct":     pnl_pct,
+        "reason":      reason,
+        "strategy":    strategy,
+        "is_paper":    bool(is_paper),
+        "order_id":    order_id,
+        "metadata":    metadata or {},
+    }
+    _post(cfg, "bot_trades", [row], upsert=False)
+
+
+__all__ = ["heartbeat", "start_run", "end_run", "log_trade"]
